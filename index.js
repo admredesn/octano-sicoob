@@ -125,10 +125,10 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
   // por sua vez exige conta completa e rejeita o endToEndId).
   const corpo = {
     endToEndId: e2e,
-    // valor em REAIS-string com 2 casas ("0.01" = R$0,01). Teste real 2026-07-18 provou:
-    // mandar "1" saiu R$1,00 -> o campo é REAIS, NÃO centavos (o exemplo "199"->1.99 do
-    // Swagger enganava). Ignoramos SICOOB_VALOR_CENTAVOS de propósito p/ não repetir o erro.
-    valor: valor.toFixed(2),
+    // valor em REAIS com VÍRGULA decimal ("0,01" = R$0,01). Padrão exigido pelo Sicoob:
+    // ^[0-9]{1,18}([,][0-9]{1,2})?$ (vírgula, não ponto). Testes reais 2026-07-18 provaram:
+    // "1" saiu R$1,00 (é reais, não centavos) e "0.01" foi rejeitado (ponto inválido).
+    valor: valor.toFixed(2).replace(".", ","),
     descricao: (descricao || "").slice(0, 140),
     meioIniciacao: "CHAVE",
     origem: {
