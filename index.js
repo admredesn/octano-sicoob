@@ -41,6 +41,10 @@ const CFG = {
   sandboxToken: process.env.SICOOB_SANDBOX_TOKEN || "",
   pfxB64: process.env.SICOOB_PFX_BASE64 || "",
   pfxSenha: process.env.SICOOB_PFX_SENHA || "",
+  // PEM (cert + chave) em base64 — preferido: o Node/OpenSSL 3 rejeita o PKCS12
+  // legado do A1 ICP-Brasil ("Unsupported PKCS12 PFX data"); PEM não tem esse problema.
+  certPemB64: process.env.SICOOB_CERT_PEM_B64 || "",
+  keyPemB64: process.env.SICOOB_KEY_PEM_B64 || "",
   dryRun: process.env.DRY_RUN !== "0",
   capPorPix: Number(process.env.CAP_POR_PIX || 50),
   capDiario: Number(process.env.CAP_DIARIO || 500),
@@ -63,8 +67,15 @@ const CFG = {
 };
 
 function agenteMtls() {
-  if (!CFG.pfxB64) return undefined;
-  return new https.Agent({ pfx: Buffer.from(CFG.pfxB64, "base64"), passphrase: CFG.pfxSenha });
+  // preferido: PEM (cert + key). Evita o erro "Unsupported PKCS12 PFX data" do A1.
+  if (CFG.certPemB64 && CFG.keyPemB64) {
+    return new https.Agent({
+      cert: Buffer.from(CFG.certPemB64, "base64"),
+      key: Buffer.from(CFG.keyPemB64, "base64"),
+    });
+  }
+  if (CFG.pfxB64) return new https.Agent({ pfx: Buffer.from(CFG.pfxB64, "base64"), passphrase: CFG.pfxSenha });
+  return undefined;
 }
 
 // ---------- teto diário (memória) ----------
