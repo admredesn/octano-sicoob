@@ -43,6 +43,13 @@ const CFG = {
   workerAtivo: process.env.WORKER_ATIVO === "1",
   pollSeg: Number(process.env.POLL_SEGUNDOS || 60),
   ua: "octano-sicoob/1.0",
+  // conta ORIGEM (de onde sai o Pix) — usada na CONFIRMAÇÃO em produção
+  origemIspb: process.env.SICOOB_ORIGEM_ISPB || "",
+  origemCnpj: process.env.SICOOB_ORIGEM_CNPJ || "",
+  origemNome: process.env.SICOOB_ORIGEM_NOME || "",
+  origemConta: process.env.SICOOB_ORIGEM_CONTA || "",
+  origemAgencia: process.env.SICOOB_ORIGEM_AGENCIA || "",
+  origemChave: process.env.SICOOB_ORIGEM_CHAVE || "",
 };
 
 function agenteMtls() {
@@ -70,17 +77,45 @@ async function getToken() {
   return _tok;
 }
 
-// ---------- chamada de Pix pagamento no Sicoob ----------
-// Sandbox validado: POST /pagamentos → 200 com endToEndId (mock ignora o corpo).
-// PRODUÇÃO: confirmar campos exatos no Swagger.
+// ---------- chamada de Pix pagamento no Sicoob (fluxo por chave DICT) ----------
+// PRODUÇÃO é em 2 passos (Swagger api.sicoob.com.br/pix-pagamentos/v2):
+//   1) POST /pagamentos {chave}           -> resolve a chave, devolve endToEndId + proprietario
+//   2) POST /pagamentos/confirmacao {...}  -> EFETIVA (o dinheiro sai aqui)
+// SANDBOX: para no passo 1 (o mock já devolve e2e; o /confirmacao do mock rejeita o origem).
+// ⚠️ Antes do go-live REAL confirmar: unidade do 'valor' (reais vs centavos) e o formato do
+//    'origem'/'destino' (a conta origem vem das envs SICOOB_ORIGEM_*).
 async function sicoobPixPagar({ token, chave, valor, descricao }) {
   if (!CFG.pixPagarUrl) throw new Error("SICOOB_PIX_PAG_URL não configurada");
-  const corpo = { valor: Number(valor.toFixed(2)), chave, descricao: (descricao || "").slice(0, 140) };
-  const r = await axios.post(CFG.pixPagarUrl, corpo, {
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", client_id: CFG.clientId, "User-Agent": CFG.ua },
-    httpsAgent: agenteMtls(), timeout: 40000,
-  });
-  return r.data;
+  const H = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", client_id: CFG.clientId, "User-Agent": CFG.ua };
+  const reqCfg = { headers: H, httpsAgent: agenteMtls(), timeout: 40000 };
+
+  // passo 1: INICIAR (resolve a chave DICT)
+  const ini = await axios.post(CFG.pixPagarUrl, { chave }, reqCfg);
+  const e2e = ini.data && ini.data.endToEndId;
+  if (!e2e) throw new Error("iniciação sem endToEndId: " + JSON.stringify(ini.data).slice(0, 200));
+
+  // sandbox: encerra aqui (não confirma)
+  if (CFG.ambiente !== "producao") return { endToEndId: e2e, estado: "SANDBOX", raw: ini.data };
+
+  // passo 2: CONFIRMAR (produção — efetiva o pagamento)
+  const prop = (ini.data && ini.data.proprietario) || {};
+  const corpo = {
+    endToEndId: e2e,
+    valor: String(valor.toFixed(2)),   // ⚠ confirmar unidade antes do go-live real
+    descricao: (descricao || "").slice(0, 140),
+    meioIniciacao: "MANUAL",
+    origem: {
+      ispb: CFG.origemIspb, cpfCnpj: CFG.origemCnpj, nome: CFG.origemNome,
+      conta: CFG.origemConta, agencia: CFG.origemAgencia, tipo: "CORRENTE",
+      ...(CFG.origemChave ? { chaveDict: CFG.origemChave } : {}),
+    },
+    destino: {
+      cpfCnpj: prop.identificador || undefined, nome: prop.nome || undefined,
+      chaveDict: chave, boolFavorecido: false,
+    },
+  };
+  const conf = await axios.post(CFG.pixPagarUrl + "/confirmacao", corpo, reqCfg);
+  return { endToEndId: (conf.data && conf.data.endToEndId) || e2e, estado: conf.data && conf.data.estado, raw: conf.data };
 }
 
 // ---------- núcleo do pagamento (usado pelo endpoint E pelo worker) ----------
