@@ -22,6 +22,13 @@ const https = require("https");
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// Railway/Raw Editor pode guardar valores COM aspas (ex.: SICOOB_AMBIENTE="producao").
+// Tira aspas envolventes de todas as envs pra não quebrar comparações (ex.: !== "producao").
+for (const k in process.env) {
+  const v = process.env[k];
+  if (typeof v === "string") process.env[k] = v.replace(/^(["'])([\s\S]*)\1$/, "$2");
+}
+
 // ---------- config (env) ----------
 const CFG = {
   porta: process.env.PORT || 8080,
