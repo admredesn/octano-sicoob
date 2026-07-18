@@ -125,7 +125,10 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
   // por sua vez exige conta completa e rejeita o endToEndId).
   const corpo = {
     endToEndId: e2e,
-    valor: CFG.valorCentavos ? String(Math.round(valor * 100)) : String(valor.toFixed(2)),
+    // valor em REAIS-string com 2 casas ("0.01" = R$0,01). Teste real 2026-07-18 provou:
+    // mandar "1" saiu R$1,00 -> o campo é REAIS, NÃO centavos (o exemplo "199"->1.99 do
+    // Swagger enganava). Ignoramos SICOOB_VALOR_CENTAVOS de propósito p/ não repetir o erro.
+    valor: valor.toFixed(2),
     descricao: (descricao || "").slice(0, 140),
     meioIniciacao: "CHAVE",
     origem: {
