@@ -121,7 +121,7 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
   // passo 2: CONFIRMAR (produção — efetiva o pagamento)
   const prop = (ini.data && ini.data.proprietario) || {};
   const corpo = {
-    endToEndId: e2e,
+    // meioIniciacao=MANUAL NÃO leva endToEndId (a iniciação acima só valida a chave / 404).
     valor: CFG.valorCentavos ? String(Math.round(valor * 100)) : String(valor.toFixed(2)),
     descricao: (descricao || "").slice(0, 140),
     meioIniciacao: "MANUAL",
