@@ -130,10 +130,9 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
       conta: CFG.origemConta, agencia: CFG.origemAgencia, tipo: "CORRENTE",
       ...(CFG.origemChave ? { chaveDict: CFG.origemChave } : {}),
     },
-    destino: {
-      cpfCnpj: prop.identificador || undefined, nome: prop.nome || undefined,
-      chaveDict: chave, boolFavorecido: false,
-    },
+    // pagamento POR CHAVE: só a chaveDict (o proprietario.identificador vem MASCARADO
+    // na iniciação, então não serve como cpfCnpj). O Sicoob resolve o destino pela chave.
+    destino: { chaveDict: chave, boolFavorecido: false },
   };
   const conf = await axios.post(CFG.pixPagarUrl + "/confirmacao", corpo, reqCfg);
   return { endToEndId: (conf.data && conf.data.endToEndId) || e2e, estado: conf.data && conf.data.estado, raw: conf.data };
@@ -155,7 +154,7 @@ async function executarPix({ chave, valor, descricao }) {
     _registraGasto(v);
     return { ok: true, e2e: resp.endToEndId || resp.e2eId || null, valor: v, raw: resp };
   } catch (e) {
-    const det = e.response ? JSON.stringify(e.response.data).slice(0, 300) : e.message;
+    const det = e.response ? JSON.stringify(e.response.data).slice(0, 1000) : e.message;
     return { ok: false, erro: "falha no Sicoob: " + det };
   }
 }
@@ -206,7 +205,7 @@ async function processarPendentes() {
         // falha: volta pra 'pendente' até 3 tentativas; depois 'falhou'
         const tent = (Number(c.tentativas) || 0) + 1;
         await _supaPatch(`oct_cashback?id=eq.${c.id}`, {
-          status: tent >= 3 ? "falhou" : "pendente", erro: String(r.erro).slice(0, 200), tentativas: tent,
+          status: tent >= 3 ? "falhou" : "pendente", erro: String(r.erro).slice(0, 900), tentativas: tent,
         });
         res.falhas++; res.itens.push({ cliente: c.cliente_nome, erro: r.erro, tentativa: tent });
       }
