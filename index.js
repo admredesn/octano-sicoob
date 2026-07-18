@@ -50,6 +50,9 @@ const CFG = {
   origemConta: process.env.SICOOB_ORIGEM_CONTA || "",
   origemAgencia: process.env.SICOOB_ORIGEM_AGENCIA || "",
   origemChave: process.env.SICOOB_ORIGEM_CHAVE || "",
+  // unidade do valor no /confirmacao. Swagger sugere CENTAVOS-string ("199" -> R$1,99).
+  // Flippável por env sem mexer no código, caso o teste de R$0,01 mostre o contrário.
+  valorCentavos: process.env.SICOOB_VALOR_CENTAVOS !== "0",
 };
 
 function agenteMtls() {
@@ -101,7 +104,7 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
   const prop = (ini.data && ini.data.proprietario) || {};
   const corpo = {
     endToEndId: e2e,
-    valor: String(valor.toFixed(2)),   // ⚠ confirmar unidade antes do go-live real
+    valor: CFG.valorCentavos ? String(Math.round(valor * 100)) : String(valor.toFixed(2)),
     descricao: (descricao || "").slice(0, 140),
     meioIniciacao: "MANUAL",
     origem: {
