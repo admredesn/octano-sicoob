@@ -119,20 +119,20 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
   if (CFG.ambiente !== "producao") return { endToEndId: e2e, estado: "SANDBOX", raw: ini.data };
 
   // passo 2: CONFIRMAR (produção — efetiva o pagamento)
-  const prop = (ini.data && ini.data.proprietario) || {};
+  // meioIniciacao (enum do Swagger): CHAVE | MANUAL | QRCODE.
+  // Fluxo por chave DICT = "CHAVE": LEVA o endToEndId da iniciação e o destino é
+  // resolvido pela chave (NÃO se manda destino manual — isso é só do MANUAL, que
+  // por sua vez exige conta completa e rejeita o endToEndId).
   const corpo = {
-    // meioIniciacao=MANUAL NÃO leva endToEndId (a iniciação acima só valida a chave / 404).
+    endToEndId: e2e,
     valor: CFG.valorCentavos ? String(Math.round(valor * 100)) : String(valor.toFixed(2)),
     descricao: (descricao || "").slice(0, 140),
-    meioIniciacao: "MANUAL",
+    meioIniciacao: "CHAVE",
     origem: {
       ispb: CFG.origemIspb, cpfCnpj: CFG.origemCnpj, nome: CFG.origemNome,
       conta: CFG.origemConta, agencia: CFG.origemAgencia, tipo: "CORRENTE",
       ...(CFG.origemChave ? { chaveDict: CFG.origemChave } : {}),
     },
-    // pagamento POR CHAVE: só a chaveDict (o proprietario.identificador vem MASCARADO
-    // na iniciação, então não serve como cpfCnpj). O Sicoob resolve o destino pela chave.
-    destino: { chaveDict: chave, boolFavorecido: false },
   };
   const conf = await axios.post(CFG.pixPagarUrl + "/confirmacao", corpo, reqCfg);
   return { endToEndId: (conf.data && conf.data.endToEndId) || e2e, estado: conf.data && conf.data.estado, raw: conf.data };
