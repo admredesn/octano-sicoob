@@ -281,12 +281,12 @@ async function notificarWhatsApp(c, pagto) {
   let tel = null, nomePosto = "seu posto";
   try {
     if (c.cliente_id) {
-      const p = await _supaGet(`oct_pessoas?id=eq.${c.cliente_id}&select=telefone,celular`);
-      if (Array.isArray(p) && p.length) tel = p[0].celular || p[0].telefone || null;
+      const p = await _supaGet(`oct_pessoas?id=eq.${c.cliente_id}&select=telefone,whatsapp`);
+      if (Array.isArray(p) && p.length) tel = p[0].whatsapp || p[0].telefone || null;
     }
     if (c.empresa_id) {
-      const e = await _supaGet(`oct_empresas?id=eq.${c.empresa_id}&select=nome_fantasia,razao_social`);
-      if (Array.isArray(e) && e.length) nomePosto = e[0].nome_fantasia || e[0].razao_social || nomePosto;
+      const e = await _supaGet(`oct_empresas?id=eq.${c.empresa_id}&select=nome,nome_fantasia`);
+      if (Array.isArray(e) && e.length) nomePosto = e[0].nome_fantasia || e[0].nome || nomePosto;
     }
   } catch (e) { /* segue sem os extras */ }
   if (!tel) return;
