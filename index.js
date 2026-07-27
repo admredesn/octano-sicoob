@@ -179,14 +179,40 @@ async function _supaPatch(query, body, prefer) {
   return r.data;
 }
 
+// ---------- ANTIFRAUDE no servidor (autoridade; o PDV também checa, mas aqui é o corte) ----------
+const JANELA_2H_MS = 2 * 3600 * 1000;
+
+// 1) o MESMO ABASTECIMENTO já gerou cashback vivo? (cancelar cupom + relançar
+//    muda a chave da NFC-e, mas o abastecimento é o mesmo -> barra aqui)
+async function _duplicadoPorAbastecimento(c) {
+  if (!Array.isArray(c.abast_ids) || !c.abast_ids.length) return null;
+  const lista = c.abast_ids.map(s => String(s).replace(/[{},"]/g, "")).join(",");
+  const q = `oct_cashback?id=neq.${c.id}&status=in.(processando,pago)` +
+    `&abast_ids=ov.{${encodeURIComponent(lista)}}&select=id,numero_nfe,status&limit=1`;
+  const dup = await _supaGet(q);
+  return (Array.isArray(dup) && dup.length) ? dup[0] : null;
+}
+
+// 2) a MESMA PESSOA (cliente ou chave Pix) recebeu nas últimas 2 horas?
+async function _bloqueado2h(c) {
+  const corte = new Date(Date.now() - JANELA_2H_MS).toISOString();
+  const filtroPessoa = c.cliente_id
+    ? `or=(cliente_id.eq.${c.cliente_id},chave_pix.eq.${encodeURIComponent(c.chave_pix)})`
+    : `chave_pix=eq.${encodeURIComponent(c.chave_pix)}`;
+  const q = `oct_cashback?id=neq.${c.id}&status=in.(processando,pago)` +
+    `&criado_em=gte.${encodeURIComponent(corte)}&${filtroPessoa}&select=id,criado_em&limit=1`;
+  const rec = await _supaGet(q);
+  return (Array.isArray(rec) && rec.length) ? rec[0] : null;
+}
+
 let _rodando = false;
 async function processarPendentes() {
   if (_rodando) return { pulado: "já rodando" };
   if (!CFG.supaUrl || !CFG.supaKey) return { erro: "Supabase não configurado" };
   _rodando = true;
-  const res = { pagos: 0, falhas: 0, itens: [] };
+  const res = { pagos: 0, falhas: 0, bloqueados: 0, itens: [] };
   try {
-    const pend = await _supaGet("oct_cashback?status=eq.pendente&chave_pix=not.is.null&select=id,cliente_nome,valor_cashback,chave_pix,tentativas&order=criado_em&limit=50");
+    const pend = await _supaGet("oct_cashback?status=eq.pendente&chave_pix=not.is.null&select=id,empresa_id,cliente_id,cliente_nome,valor_cashback,chave_pix,tentativas,abast_ids,litros&order=criado_em&limit=50");
     for (const c of pend) {
       // 1) REIVINDICA a linha: vira 'processando' só se AINDA estava 'pendente'.
       //    (dois polls concorrentes: só um consegue; o outro recebe [] e pula.)
@@ -195,6 +221,29 @@ async function processarPendentes() {
         claim = await _supaPatch(`oct_cashback?id=eq.${c.id}&status=eq.pendente`, { status: "processando" });
       } catch (e) { continue; }
       if (!Array.isArray(claim) || !claim.length) continue;   // já foi reivindicada
+
+      // 1.5) ANTIFRAUDE (depois do claim, antes do dinheiro sair)
+      try {
+        const dup = await _duplicadoPorAbastecimento(c);
+        if (dup) {
+          await _supaPatch(`oct_cashback?id=eq.${c.id}`,
+            { status: "duplicado", erro: `abastecimento já pagou cashback (cupom ${dup.numero_nfe || dup.id})` });
+          res.bloqueados++; res.itens.push({ cliente: c.cliente_nome, bloqueio: "duplicado" });
+          continue;
+        }
+        const rec2h = await _bloqueado2h(c);
+        if (rec2h) {
+          await _supaPatch(`oct_cashback?id=eq.${c.id}`,
+            { status: "bloqueado_2h", erro: `cliente já recebeu cashback às ${rec2h.criado_em} (janela 2h)` });
+          res.bloqueados++; res.itens.push({ cliente: c.cliente_nome, bloqueio: "2h" });
+          continue;
+        }
+      } catch (e) {
+        // antifraude indisponível = NÃO paga (fail-safe): volta pra pendente e tenta no próximo poll
+        await _supaPatch(`oct_cashback?id=eq.${c.id}`, { status: "pendente", erro: "antifraude falhou: " + e.message.slice(0, 200) });
+        continue;
+      }
+
       // 2) paga
       const r = await executarPix({ chave: c.chave_pix, valor: Number(c.valor_cashback), descricao: "Cashback Octano" });
       // 3) marca resultado
@@ -204,6 +253,7 @@ async function processarPendentes() {
           tentativas: (Number(c.tentativas) || 0) + 1,
         });
         res.pagos++; res.itens.push({ cliente: c.cliente_nome, valor: r.valor, e2e: r.e2e, dry: !!r.dry_run });
+        notificarWhatsApp(c, r).catch(e => console.log("wpp:", e.message));   // best-effort, não trava o worker
       } else {
         // falha: volta pra 'pendente' até 3 tentativas; depois 'falhou'
         const tent = (Number(c.tentativas) || 0) + 1;
@@ -217,6 +267,46 @@ async function processarPendentes() {
     res.erro = e.message;
   } finally { _rodando = false; }
   return res;
+}
+
+// ============================================================
+// NOTIFICAÇÃO WhatsApp do cashback pago (via gateway octano-wpp)
+// Envs: WPP_URL, WPP_TOKEN, WPP_LOGO_B64 (opcional: logo do posto em base64 ->
+// manda imagem com legenda; sem logo manda texto).
+// ============================================================
+async function notificarWhatsApp(c, pagto) {
+  if (!process.env.WPP_URL || !process.env.WPP_TOKEN) return;
+  if (pagto && pagto.dry_run) return;   // simulação não notifica
+  // telefone do cliente (oct_pessoas)
+  let tel = null, nomePosto = "seu posto";
+  try {
+    if (c.cliente_id) {
+      const p = await _supaGet(`oct_pessoas?id=eq.${c.cliente_id}&select=telefone,celular`);
+      if (Array.isArray(p) && p.length) tel = p[0].celular || p[0].telefone || null;
+    }
+    if (c.empresa_id) {
+      const e = await _supaGet(`oct_empresas?id=eq.${c.empresa_id}&select=nome_fantasia,razao_social`);
+      if (Array.isArray(e) && e.length) nomePosto = e[0].nome_fantasia || e[0].razao_social || nomePosto;
+    }
+  } catch (e) { /* segue sem os extras */ }
+  if (!tel) return;
+  const valor = Number(c.valor_cashback).toFixed(2).replace(".", ",");
+  const litros = c.litros ? Number(c.litros).toFixed(2).replace(".", ",") + " litros" : "seu abastecimento";
+  const nome = (c.cliente_nome || "").split(" ")[0];
+  const msg =
+    `🎉 *Cashback recebido!*\n\n` +
+    `Olá${nome ? " " + nome : ""}! Você acabou de receber *R$ ${valor}* de cashback ` +
+    `pelo abastecimento de ${litros} no *${nomePosto}*.\n\n` +
+    `💰 O Pix já está na sua conta.\n\n` +
+    `Obrigado pela preferência — bom trajeto e até o próximo abastecimento! ⛽`;
+  const H = { "Content-Type": "application/json", "x-wpp-token": process.env.WPP_TOKEN };
+  const base = process.env.WPP_URL.replace(/\/$/, "");
+  const logo = (process.env.WPP_LOGO_B64 || "").trim();
+  if (logo) {
+    await axios.post(base + "/send-image", { phone: tel, image: logo, caption: msg }, { headers: H, timeout: 30000 });
+  } else {
+    await axios.post(base + "/send-text", { phone: tel, message: msg }, { headers: H, timeout: 30000 });
+  }
 }
 
 // ---------- auth do gateway ----------
