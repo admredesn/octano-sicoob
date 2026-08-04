@@ -141,6 +141,45 @@ async function sicoobPixPagar({ token, chave, valor, descricao }) {
   return { endToEndId: (conf.data && conf.data.endToEndId) || e2e, estado: conf.data && conf.data.estado, raw: conf.data };
 }
 
+// ---------- NORMALIZAÇÃO DA CHAVE PIX ----------
+// O DICT exige formato exato. O cliente digita "31999998526" (celular sem +55)
+// e o Sicoob devolve 404 "A chave DICT não foi encontrada" — foi o que
+// aconteceu em 04/08. Aqui arrumamos o que dá para arrumar, e o chamador
+// ainda tenta a variante se a primeira falhar.
+function _cpfValido(cpf) {
+  if (!/^\d{11}$/.test(cpf) || /^(\d){10}$/.test(cpf)) return false;
+  for (const n of [9, 10]) {
+    let soma = 0;
+    for (let i = 0; i < n; i++) soma += Number(cpf[i]) * ((n + 1) - i);
+    const dig = (soma * 10 % 11) % 10;
+    if (dig !== Number(cpf[n])) return false;
+  }
+  return true;
+}
+
+// devolve as formas a tentar, na ordem (a 1ª é a mais provável)
+function variantesChave(chaveBruta) {
+  const chave = String(chaveBruta || "").trim();
+  if (!chave) return [];
+  if (chave.includes("@")) return [chave.toLowerCase()];                  // e-mail
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(chave)) return [chave.toLowerCase()];  // EVP (aleatória)
+  if (chave.startsWith("+")) return [chave, chave.replace(/\D/g, "")];
+  const d = chave.replace(/\D/g, "");
+  if (!d) return [chave];
+  if (d.length === 14) return [d];                                        // CNPJ
+  if (d.length === 13 && d.startsWith("55")) return ["+" + d, d];
+  if (d.length === 12 && d.startsWith("55")) return ["+" + d, d];
+  if (d.length === 11) {
+    // ambíguo: CPF ou celular (DDD + 9 + 8). Celular tem o 3º dígito = 9.
+    const pareceCelular = d[2] === "9" && Number(d.slice(0, 2)) >= 11;
+    return pareceCelular && !_cpfValido(d) ? ["+55" + d, d]
+         : _cpfValido(d) ? [d, "+55" + d]
+         : ["+55" + d, d];
+  }
+  if (d.length === 10) return ["+55" + d, d];                             // fixo com DDD
+  return [chave];
+}
+
 // ---------- núcleo do pagamento (usado pelo endpoint E pelo worker) ----------
 // valida tetos, dry-run e devolve {ok, e2e|erro}. NÃO cuida de idempotência de
 // registro (isso é do chamador: o endpoint usa a chave; o worker usa o claim).
@@ -151,15 +190,26 @@ async function executarPix({ chave, valor, descricao }) {
   if (v > CFG.capPorPix) return { ok: false, erro: `acima do teto por Pix (R$${CFG.capPorPix})` };
   if (_gastoHoje() + v > CFG.capDiario) return { ok: false, erro: `estouraria o teto diário (R$${CFG.capDiario})` };
   if (CFG.dryRun) { _registraGasto(v); return { ok: true, dry_run: true, e2e: "SIMULADO", valor: v }; }
-  try {
-    const token = await getToken();
-    const resp = await sicoobPixPagar({ token, chave, valor: v, descricao });
-    _registraGasto(v);
-    return { ok: true, e2e: resp.endToEndId || resp.e2eId || null, valor: v, raw: resp };
-  } catch (e) {
-    const det = e.response ? JSON.stringify(e.response.data).slice(0, 1000) : e.message;
-    return { ok: false, erro: "falha no Sicoob: " + det };
+  // tenta as variantes da chave (ex.: "31999998526" -> "+5531999998526").
+  // Só insiste quando o erro é "chave não encontrada" (DICT) — em qualquer
+  // outra falha para na hora, para não repetir tentativa de pagamento.
+  const tentativas = variantesChave(chave);
+  let ultimoErro = "chave_pix inválida";
+  for (const c of tentativas) {
+    try {
+      const token = await getToken();
+      const resp = await sicoobPixPagar({ token, chave: c, valor: v, descricao });
+      _registraGasto(v);
+      return { ok: true, e2e: resp.endToEndId || resp.e2eId || null, valor: v,
+               chave_usada: c, raw: resp };
+    } catch (e) {
+      const det = e.response ? JSON.stringify(e.response.data).slice(0, 1000) : e.message;
+      ultimoErro = "falha no Sicoob: " + det;
+      const naoEncontrada = /NaoEncontrado|n[aã]o foi encontrada|404/i.test(det);
+      if (!naoEncontrada) break;      // erro real (saldo, permissão...): não insiste
+    }
   }
+  return { ok: false, erro: ultimoErro, chave_tentativas: tentativas };
 }
 
 // ============================================================
