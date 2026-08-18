@@ -359,6 +359,141 @@ async function notificarWhatsApp(c, pagto) {
   }
 }
 
+// ============================================================
+// EXTRATO — importa o extrato da conta de CADA posto (API Conta Corrente v4)
+// para oct_banco_movimentos. O conciliador (sync 6/6h no PC dev) casa os
+// débitos com oct_contas_pagar (baixa automática + juros/multa/desconto).
+// Config por posto em oct_sicoob_contas (numero_conta, client_id, env_prefix,
+// ambiente). Certificado por posto nas envs SICOOB_CERT_PEM_B64_<PREFIX> /
+// SICOOB_KEY_PEM_B64_<PREFIX> (mesmo A1 e-CNPJ da NF-e). Sandbox usa o token
+// fixo do portal (sem mTLS).
+// Envs: EXTRATO_ATIVO=1, EXTRATO_POLL_SEGUNDOS (padrão 1800), EXTRATO_DIAS (5).
+// ============================================================
+const crypto = require("crypto");
+const EXT = {
+  ativo: process.env.EXTRATO_ATIVO === "1",
+  pollSeg: Number(process.env.EXTRATO_POLL_SEGUNDOS || 1800),
+  dias: Number(process.env.EXTRATO_DIAS || 5),
+  urlSandbox: "https://sandbox.sicoob.com.br/sicoob/sandbox/conta-corrente/v4",
+  urlProd: "https://api.sicoob.com.br/conta-corrente/v4",
+  scope: process.env.SICOOB_EXTRATO_SCOPE || "cco_consulta cco_extrato",
+  estado: { ultima: null, contas: {}, erro: null },
+};
+
+function _agentePrefix(prefix) {
+  const cert = process.env[`SICOOB_CERT_PEM_B64_${prefix}`];
+  const key = process.env[`SICOOB_KEY_PEM_B64_${prefix}`];
+  if (cert && key) return new https.Agent({ cert: Buffer.from(cert, "base64"), key: Buffer.from(key, "base64") });
+  return agenteMtls();   // fallback: certificado global
+}
+
+// token OAuth por conta (produção), cacheado por empresa
+const _tokConta = {};
+async function _tokenConta(conta) {
+  if ((conta.ambiente || "producao") === "sandbox") return CFG.sandboxToken;
+  const k = conta.empresa_id;
+  const c = _tokConta[k];
+  if (c && Date.now() < c.exp - 30000) return c.tok;
+  const body = new URLSearchParams({ grant_type: "client_credentials", client_id: conta.client_id, scope: EXT.scope });
+  const r = await axios.post(CFG.tokenUrl, body.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    httpsAgent: _agentePrefix(conta.env_prefix || ""), timeout: 30000,
+  });
+  _tokConta[k] = { tok: r.data.access_token, exp: Date.now() + Number(r.data.expires_in || 300) * 1000 };
+  return _tokConta[k].tok;
+}
+
+// data do extrato pode vir "dd/mm/aaaa" (produção) ou ISO — normaliza p/ aaaa-mm-dd
+function _dataISO(s) {
+  const t = String(s || "").trim();
+  let m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[0];
+  return null;
+}
+function _valorNum(v) {
+  if (typeof v === "number") return v;
+  const s = String(v || "").replace(/\./g, "").replace(",", ".").replace(/[^0-9.\-]/g, "");
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+async function _extratoConta(conta, mes, ano, diaIni, diaFim) {
+  const base = (conta.ambiente || "producao") === "sandbox" ? EXT.urlSandbox : EXT.urlProd;
+  const token = await _tokenConta(conta);
+  const url = `${base}/extrato/${mes}/${ano}?diaInicial=${diaIni}&diaFinal=${diaFim}` +
+              `&numeroContaCorrente=${encodeURIComponent(conta.numero_conta)}`;
+  const r = await axios.get(url, {
+    headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id || CFG.clientId },
+    httpsAgent: (conta.ambiente || "producao") === "sandbox" ? undefined : _agentePrefix(conta.env_prefix || ""),
+    timeout: 40000,
+  });
+  const d = r.data || {};
+  return d.transacoes || d.resultado?.transacoes || [];
+}
+
+async function importarExtratos() {
+  if (!CFG.supaUrl || !CFG.supaKey) return { erro: "Supabase não configurado" };
+  const res = { contas: 0, gravados: 0, lidos: 0 };
+  const contas = await _supaGet("oct_sicoob_contas?ativo=eq.true&select=*");
+  const hoje = new Date();
+  const ini = new Date(hoje.getTime() - EXT.dias * 864e5);
+  // janelas por mês (a consulta é mensal; virada de mês vira 2 chamadas)
+  const janelas = [];
+  if (ini.getMonth() === hoje.getMonth() && ini.getFullYear() === hoje.getFullYear()) {
+    janelas.push({ mes: hoje.getMonth() + 1, ano: hoje.getFullYear(), d1: ini.getDate(), d2: hoje.getDate() });
+  } else {
+    const fimIni = new Date(ini.getFullYear(), ini.getMonth() + 1, 0).getDate();
+    janelas.push({ mes: ini.getMonth() + 1, ano: ini.getFullYear(), d1: ini.getDate(), d2: fimIni });
+    janelas.push({ mes: hoje.getMonth() + 1, ano: hoje.getFullYear(), d1: 1, d2: hoje.getDate() });
+  }
+  for (const conta of contas) {
+    res.contas++;
+    const st = { lidos: 0, gravados: 0, erro: null };
+    try {
+      const linhas = [];
+      for (const j of janelas) {
+        const trans = await _extratoConta(conta, j.mes, j.ano, j.d1, j.d2);
+        st.lidos += trans.length;
+        // id determinístico: conta+data+doc+valor+descrição+contador entre iguais
+        const vistos = {};
+        for (const t of trans) {
+          const data = _dataISO(t.data) || _dataISO(t.dataLote);
+          const valor = _valorNum(t.valor);
+          if (!data || valor === null) continue;
+          const tipoStr = String(t.tipo || "").toUpperCase();
+          const debito = /D[EÉ]B/.test(tipoStr) || valor < 0;
+          const chave = `${conta.empresa_id}|${data}|${t.numeroDocumento || ""}|${Math.abs(valor)}|${(t.descricao || "").slice(0, 40)}`;
+          vistos[chave] = (vistos[chave] || 0) + 1;
+          linhas.push({
+            id: crypto.createHash("sha1").update(`${chave}|${vistos[chave]}`).digest("hex"),
+            empresa_id: conta.empresa_id, banco: "sicoob",
+            data, valor: Math.abs(valor), tipo: debito ? "debito" : "credito",
+            descricao: (t.descricao || "").slice(0, 200) || null,
+            documento: t.numeroDocumento || null,
+            cpf_cnpj: (t.cpfCnpj || "").replace(/\D/g, "") || null,
+            info: (t.descInfComplementar || "").slice(0, 300) || null,
+          });
+        }
+      }
+      if (linhas.length) {
+        await axios.post(`${CFG.supaUrl}/rest/v1/oct_banco_movimentos?on_conflict=id`, linhas, {
+          headers: _supaHeaders({ Prefer: "resolution=ignore-duplicates,return=minimal" }), timeout: 40000,
+        });
+        st.gravados = linhas.length;
+        res.gravados += linhas.length;
+      }
+      res.lidos += st.lidos;
+    } catch (e) {
+      st.erro = (e.response ? JSON.stringify(e.response.data) : e.message).slice(0, 300);
+    }
+    EXT.estado.contas[conta.empresa_id] = { ...st, quando: new Date().toISOString() };
+  }
+  EXT.estado.ultima = new Date().toISOString();
+  return res;
+}
+
 // ---------- auth do gateway ----------
 function checaToken(req, res) {
   const t = req.get("X-Sicoob-Token") || "";
@@ -391,10 +526,29 @@ app.get("/worker/rodar", async (req, res) => {
   res.json(await processarPendentes());
 });
 
+// GET /extrato/status → última importação por conta
+app.get("/extrato/status", (req, res) => {
+  res.json({ ok: true, ativo: EXT.ativo, poll_seg: EXT.pollSeg, dias: EXT.dias, ...EXT.estado });
+});
+
+// POST /extrato/sync → importa os extratos agora (teste/manual)
+app.post("/extrato/sync", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try { res.json(await importarExtratos()); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
 app.listen(CFG.porta, () => {
   console.log(`octano-sicoob on :${CFG.porta} [${CFG.ambiente}] dry_run=${CFG.dryRun} worker=${CFG.workerAtivo}`);
   if (CFG.workerAtivo) {
     setInterval(() => { processarPendentes().then(r => { if (r.pagos || r.falhas) console.log("worker:", JSON.stringify(r)); }); },
       Math.max(15, CFG.pollSeg) * 1000);
+  }
+  if (EXT.ativo) {
+    importarExtratos().then(r => console.log("extrato:", JSON.stringify(r))).catch(e => console.log("extrato:", e.message));
+    setInterval(() => {
+      importarExtratos().then(r => { if (r.gravados) console.log("extrato:", JSON.stringify(r)); })
+        .catch(e => console.log("extrato:", e.message));
+    }, Math.max(300, EXT.pollSeg) * 1000);
   }
 });
