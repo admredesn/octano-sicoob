@@ -414,7 +414,11 @@ function _dataISO(s) {
 }
 function _valorNum(v) {
   if (typeof v === "number") return v;
-  const s = String(v || "").replace(/\./g, "").replace(",", ".").replace(/[^0-9.\-]/g, "");
+  let s = String(v || "").trim();
+  // produção manda formato AMERICANO ("1700.00" — validado 19/08 na conta real);
+  // só trata como BR ("1.700,00") quando existe vírgula decimal.
+  if (s.includes(",")) s = s.replace(/\./g, "").replace(",", ".");
+  s = s.replace(/[^0-9.\-]/g, "");
   const n = Number(s);
   return isFinite(n) ? n : null;
 }
@@ -467,7 +471,9 @@ async function importarExtratos() {
           const chave = `${conta.empresa_id}|${data}|${t.numeroDocumento || ""}|${Math.abs(valor)}|${(t.descricao || "").slice(0, 40)}`;
           vistos[chave] = (vistos[chave] || 0) + 1;
           linhas.push({
-            id: crypto.createHash("sha1").update(`${chave}|${vistos[chave]}`).digest("hex"),
+            // produção tem transactionId (id perfeito); fallback: hash determinístico
+            id: t.transactionId ? "sicoob-" + t.transactionId
+              : crypto.createHash("sha1").update(`${chave}|${vistos[chave]}`).digest("hex"),
             empresa_id: conta.empresa_id, banco: "sicoob",
             data, valor: Math.abs(valor), tipo: debito ? "debito" : "credito",
             descricao: (t.descricao || "").slice(0, 200) || null,
