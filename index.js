@@ -255,6 +255,18 @@ async function _bloqueado2h(c) {
   return (Array.isArray(rec) && rec.length) ? rec[0] : null;
 }
 
+// CHAVE GERAL por posto (pedido Ronan 20/08): oct_empresas.cashback_ativo.
+// Sem TRUE explícito o posto NÃO paga cashback — posto que não oferece a
+// função fica protegido mesmo que alguém crie pendentes por engano.
+let _cbAtivoCache = { ts: 0, set: null };
+async function _cashbackLigado(empresaId) {
+  if (!_cbAtivoCache.set || Date.now() - _cbAtivoCache.ts > 60000) {
+    const rows = await _supaGet("oct_empresas?cashback_ativo=eq.true&select=id");
+    _cbAtivoCache = { ts: Date.now(), set: new Set(rows.map(r => r.id)) };
+  }
+  return _cbAtivoCache.set.has(empresaId);
+}
+
 let _rodando = false;
 async function processarPendentes() {
   if (_rodando) return { pulado: "já rodando" };
@@ -271,6 +283,20 @@ async function processarPendentes() {
         claim = await _supaPatch(`oct_cashback?id=eq.${c.id}&status=eq.pendente`, { status: "processando" });
       } catch (e) { continue; }
       if (!Array.isArray(claim) || !claim.length) continue;   // já foi reivindicada
+
+      // 1.4) CHAVE GERAL do posto — desligado NÃO paga (fail-safe: erro na
+      //      checagem devolve pra pendente, igual ao antifraude)
+      try {
+        if (!(await _cashbackLigado(c.empresa_id))) {
+          await _supaPatch(`oct_cashback?id=eq.${c.id}`,
+            { status: "bloqueado_off", erro: "cashback DESLIGADO p/ este posto (chave geral na tela Empresa)" });
+          res.bloqueados++; res.itens.push({ cliente: c.cliente_nome, bloqueio: "posto_off" });
+          continue;
+        }
+      } catch (e) {
+        await _supaPatch(`oct_cashback?id=eq.${c.id}`, { status: "pendente", erro: "chave geral indisponível: " + e.message.slice(0, 200) });
+        continue;
+      }
 
       // 1.5) ANTIFRAUDE (depois do claim, antes do dinheiro sair)
       try {
