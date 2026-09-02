@@ -1011,6 +1011,11 @@ function _transporteEmail(par) {
       host, port: porta,
       secure: porta === 465,                // 465 = TLS direto; 587 = STARTTLS
       auth: { user: de, pass: senha },
+      // o padrao do nodemailer e' 2 minutos pendurado. Quem esta' na tela nao
+      // espera isso -- e "nao respondeu em 20s" ja' e' o diagnostico completo.
+      connectionTimeout: 20000,
+      greetingTimeout: 15000,
+      socketTimeout: 30000,
     }),
   };
 }
