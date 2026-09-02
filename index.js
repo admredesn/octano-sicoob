@@ -19,6 +19,7 @@ const express = require("express");
 const axios = require("axios");
 const https = require("https");
 const { gerarBoletoPdf } = require("./boleto_pdf");
+const { gerarFaturaPdf } = require("./fatura_pdf");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -908,6 +909,70 @@ app.get("/boleto/pdf", async (req, res) => {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition",
                   `inline; filename="boleto-${nosso_numero}.pdf"`);
+    res.send(pdf);
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: String(e.message || e) });
+  }
+});
+
+// GET /fatura/pdf?fatura_id=..  -> application/pdf
+// A fatura e' o EXTRATO: uma linha por abastecimento, com placa/odometro/cupom.
+// Monta a partir dos titulos que a compoem (oct_pdv_notas_prazo.fatura_id) e
+// dos itens do cupom de cada um.
+app.get("/fatura/pdf", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try {
+    const { fatura_id } = req.query || {};
+    const fat = (await _supaGet(`oct_faturas?id=eq.${fatura_id}&select=*`))[0];
+    if (!fat) return res.status(404).json({ ok: false, erro: "fatura não encontrada" });
+
+    const emp = (await _supaGet(
+      `oct_empresas?id=eq.${fat.empresa_id}&select=nome,cnpj,endereco,cidade,uf,cep`))[0] || {};
+    const cli = fat.cliente_id
+      ? (await _supaGet(`oct_pessoas?id=eq.${fat.cliente_id}&select=*`))[0] || {}
+      : {};
+
+    // titulos da fatura -> cupons -> itens
+    const titulos = await _supaGet(
+      `oct_pdv_notas_prazo?fatura_id=eq.${fatura_id}&select=numero_nfe,valor,registrado_em` +
+      `&order=registrado_em`);
+    const nums = titulos.map(t => t.numero_nfe).filter(Boolean);
+    let vendas = [];
+    if (nums.length) {
+      vendas = await _supaGet(
+        `oct_pdv_vendas?empresa_id=eq.${fat.empresa_id}&numero=in.(${nums.join(",")})` +
+        `&select=numero,data_venda,placa,odometro,veiculo,itens&limit=500`);
+    }
+    const porNum = {};
+    vendas.forEach(v => { porNum[String(v.numero)] = v; });
+
+    const linhas = [];
+    titulos.forEach(t => {
+      const v = porNum[String(t.numero_nfe)];
+      const quando = (v && v.data_venda) || t.registrado_em;
+      const itens = (v && Array.isArray(v.itens)) ? v.itens : [];
+      if (!itens.length) {
+        // sem o cupom espelhado, ao menos o titulo aparece — melhor uma linha
+        // sem detalhe do que a fatura nao fechar com o total.
+        linhas.push({ data: quando, produto: "ABASTECIMENTO", cupom: t.numero_nfe,
+                      hora: String(quando || "").slice(11, 19),
+                      qtd: 0, unit: 0, total: Number(t.valor || 0) });
+        return;
+      }
+      itens.forEach(it => {
+        linhas.push({
+          data: quando, produto: it.desc || it.produto || "", cod: it.cod,
+          placa: v.placa, odometro: v.odometro, veiculo: v.veiculo,
+          hora: String(quando || "").slice(11, 19), cupom: t.numero_nfe,
+          qtd: Number(it.qtd || 0), unit: Number(it.unit || 0),
+          total: Number(it.total != null ? it.total : (it.qtd || 0) * (it.unit || 0)),
+        });
+      });
+    });
+
+    const pdf = await gerarFaturaPdf(fat, cli, emp, linhas);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="fatura-${fat.numero || fat.id}.pdf"`);
     res.send(pdf);
   } catch (e) {
     res.status(500).json({ ok: false, erro: String(e.message || e) });
