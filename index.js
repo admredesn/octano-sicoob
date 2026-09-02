@@ -887,6 +887,11 @@ if (process.env.BOLETO_WORKER === "1") {
   console.log(`[boletos] worker ligado (a cada ${BOL_POLL}s)`);
 }
 
+if (process.env.BOLETO_WORKER === "1") {
+  setInterval(_workerFaturasPdf, BOL_POLL * 1000);
+  console.log(`[fatura-pdf] worker ligado (a cada ${BOL_POLL}s)`);
+}
+
 // GET /boleto/pdf?empresa_id=..&nosso_numero=..  -> application/pdf
 // O desenho vive em boleto_pdf.js. A tela do retaguarda imprime do HTML dela;
 // esta rota existe para o ENVIO, que precisa de um arquivo de verdade.
@@ -919,12 +924,10 @@ app.get("/boleto/pdf", async (req, res) => {
 // A fatura e' o EXTRATO: uma linha por abastecimento, com placa/odometro/cupom.
 // Monta a partir dos titulos que a compoem (oct_pdv_notas_prazo.fatura_id) e
 // dos itens do cupom de cada um.
-app.get("/fatura/pdf", async (req, res) => {
-  if (!checaToken(req, res)) return;
-  try {
-    const { fatura_id } = req.query || {};
+async function montarFaturaPdf(fatura_id) {
+  {
     const fat = (await _supaGet(`oct_faturas?id=eq.${fatura_id}&select=*`))[0];
-    if (!fat) return res.status(404).json({ ok: false, erro: "fatura não encontrada" });
+    if (!fat) throw new Error("fatura não encontrada");
 
     const emp = (await _supaGet(
       `oct_empresas?id=eq.${fat.empresa_id}&select=nome,cnpj,endereco,cidade,uf,cep`))[0] || {};
@@ -971,6 +974,14 @@ app.get("/fatura/pdf", async (req, res) => {
     });
 
     const pdf = await gerarFaturaPdf(fat, cli, emp, linhas);
+    return { pdf, fat };
+  }
+}
+
+app.get("/fatura/pdf", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try {
+    const { pdf, fat } = await montarFaturaPdf((req.query || {}).fatura_id);
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename="fatura-${fat.numero || fat.id}.pdf"`);
     res.send(pdf);
@@ -978,6 +989,46 @@ app.get("/fatura/pdf", async (req, res) => {
     res.status(500).json({ ok: false, erro: String(e.message || e) });
   }
 });
+
+// ---------- WORKER: gera a fatura pedida pela tela e arquiva na nuvem ----------
+// O caminho segue a convencao dos documentos fiscais:
+//   <empresa_id>/<ano>/<mes>/fatura-<numero>.pdf
+async function _supaUpload(bucket, caminho, buf, tipo) {
+  await axios.post(`${CFG.supaUrl}/storage/v1/object/${bucket}/${caminho}`, buf, {
+    headers: {
+      apikey: CFG.supaKey, Authorization: "Bearer " + CFG.supaKey,
+      "Content-Type": tipo, "x-upsert": "true",
+    },
+    timeout: 45000, maxBodyLength: Infinity, maxContentLength: Infinity,
+  });
+  return caminho;
+}
+
+async function _workerFaturasPdf() {
+  try {
+    const pend = await _supaGet(
+      "oct_faturas?fatura_pdf_pedido_em=not.is.null&fatura_pdf_path=is.null" +
+      "&select=id&order=fatura_pdf_pedido_em&limit=10");
+    for (const p of pend) {
+      try {
+        const { pdf, fat } = await montarFaturaPdf(p.id);
+        const d = String(fat.emissao || fat.criado_em || new Date().toISOString()).slice(0, 10);
+        const caminho = `${fat.empresa_id}/${d.slice(0, 4)}/${d.slice(5, 7)}/` +
+                        `fatura-${fat.numero || fat.id}.pdf`;
+        await _supaUpload("octano-documentos", caminho, pdf, "application/pdf");
+        await _supaPatch(`oct_faturas?id=eq.${p.id}`,
+          { fatura_pdf_path: caminho, fatura_pdf_pedido_em: null, envio_erro: null }, "return=minimal");
+      } catch (e) {
+        // limpa o pedido: sem isso a fatura quebrada seria retentada para sempre
+        await _supaPatch(`oct_faturas?id=eq.${p.id}`,
+          { fatura_pdf_pedido_em: null, envio_erro: ("PDF da fatura: " + String(e.message || e)).slice(0, 900) },
+          "return=minimal");
+      }
+    }
+  } catch (e) {
+    console.error("[fatura-pdf] worker:", e.message);
+  }
+}
 
 // GET /boleto/consultar?empresa_id=..&nosso_numero=..
 app.get("/boleto/consultar", async (req, res) => {
