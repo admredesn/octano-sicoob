@@ -1,13 +1,14 @@
 {
   "name": "octano-sicoob",
   "version": "0.1.0",
-  "description": "Gateway de pagamento Pix (Sicoob) para o cashback do Octano",
+  "description": "Gateway Sicoob do Octano: Pix (cashback), extrato e cobranca bancaria (boleto)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "axios": "^1.7.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "pdfkit": "^0.15.0"
   }
 }

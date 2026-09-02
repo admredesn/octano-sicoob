@@ -18,6 +18,7 @@
 const express = require("express");
 const axios = require("axios");
 const https = require("https");
+const { gerarBoletoPdf } = require("./boleto_pdf");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -884,6 +885,34 @@ if (process.env.BOLETO_WORKER === "1") {
   setInterval(_workerBoletos, BOL_POLL * 1000);
   console.log(`[boletos] worker ligado (a cada ${BOL_POLL}s)`);
 }
+
+// GET /boleto/pdf?empresa_id=..&nosso_numero=..  -> application/pdf
+// O desenho vive em boleto_pdf.js. A tela do retaguarda imprime do HTML dela;
+// esta rota existe para o ENVIO, que precisa de um arquivo de verdade.
+app.get("/boleto/pdf", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try {
+    const { empresa_id, nosso_numero } = req.query || {};
+    const linha = (await _supaGet(
+      `oct_boletos?empresa_id=eq.${empresa_id}&nosso_numero=eq.${nosso_numero}` +
+      `&select=resposta,valor,vencimento,cliente_nome&limit=1`))[0];
+    if (!linha) return res.status(404).json({ ok: false, erro: "boleto não encontrado" });
+    const dados = (linha.resposta && (linha.resposta.resultado || linha.resposta)) || {};
+    if (!dados.linhaDigitavel)
+      return res.status(409).json({ ok: false, erro: "boleto sem retorno do banco (não registrado?)" });
+    const conta = (await _supaGet(
+      `oct_sicoob_contas?empresa_id=eq.${empresa_id}&select=*`))[0] || {};
+    const emp = (await _supaGet(
+      `oct_empresas?id=eq.${empresa_id}&select=nome,cnpj,endereco,cidade,uf,cep`))[0] || {};
+    const pdf = await gerarBoletoPdf(dados, conta, emp);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition",
+                  `inline; filename="boleto-${nosso_numero}.pdf"`);
+    res.send(pdf);
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: String(e.message || e) });
+  }
+});
 
 // GET /boleto/consultar?empresa_id=..&nosso_numero=..
 app.get("/boleto/consultar", async (req, res) => {
