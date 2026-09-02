@@ -734,6 +734,21 @@ async function registrarBoleto(fatura_id, opts) {
     return { http: 422, corpo: { ok: false, erro: "cadastro do cliente incompleto para boleto",
                                  faltando: faltas, cliente: pag.nome } };
 
+  // TOKEN PRIMEIRO: reservar o nosso numero antes queimava um numero da faixa a
+  // cada falha de autenticacao (o contador nao volta atras).
+  let token = null;
+  if (!COB.dryRun) {
+    try {
+      token = await _tokenCobranca(conta);
+    } catch (e) {
+      const det = e.response?.data || e.message;
+      return { http: 401, corpo: { ok: false, erro: "Sicoob não autorizou o token de cobrança",
+                                   detalhe: det },
+               patch: { status: "erro",
+                        erro: ("TOKEN: " + JSON.stringify(det)).slice(0, 900) } };
+    }
+  }
+
   const nossoNumero = await _proximoNossoNumero(conta);
   const corpo = _montarBoleto(conta, fat, pag, nossoNumero);
   const patch = {
@@ -750,7 +765,6 @@ async function registrarBoleto(fatura_id, opts) {
   }
 
   const base = (conta.ambiente || "producao") === "sandbox" ? COB.urlSandbox : COB.urlProd;
-  const token = await _tokenCobranca(conta);
   try {
     const resp = await axios.post(`${base}/boletos`, corpo, {
       headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id,
