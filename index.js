@@ -717,9 +717,15 @@ async function registrarBoleto(fatura_id, opts) {
   const conta = (await _supaGet(
     `oct_sicoob_contas?empresa_id=eq.${fat.empresa_id}&ativo=eq.true&select=*`))[0];
   if (!conta) return { http: 400, corpo: { ok: false, erro: "posto sem conta Sicoob configurada" } };
-  if (!conta.cobranca_ativa || !conta.numero_cliente)
+  // numero_cliente e' indispensavel ate' para MONTAR o payload.
+  if (!conta.numero_cliente)
     return { http: 400, corpo: { ok: false, erro: "convênio de cobrança não configurado para este posto",
-      detalhe: "faltam numero_cliente e/ou cobranca_ativa em oct_sicoob_contas" } };
+      detalhe: "falta numero_cliente em oct_sicoob_contas" } };
+  // cobranca_ativa e' a trava de EMISSAO, nao de simulacao: no dry-run o payload
+  // precisa poder ser montado e conferido ANTES de alguem ligar a chave.
+  if (!conta.cobranca_ativa && !COB.dryRun)
+    return { http: 400, corpo: { ok: false, erro: "cobrança não está ativa para este posto",
+      detalhe: "ligue cobranca_ativa em oct_sicoob_contas quando quiser emitir de verdade" } };
 
   const pag = (await _supaGet(`oct_pessoas?id=eq.${fat.cliente_id}&select=*`))[0];
   if (!pag) return { http: 400, corpo: { ok: false, erro: "cliente da fatura não encontrado" } };
