@@ -28,6 +28,13 @@ function dataBr(s) {
   return s.length === 10 ? `${s.slice(8, 10)}/${s.slice(5, 7)}/${s.slice(0, 4)}` : s;
 }
 
+// O que se cobra e' o LIQUIDO. A coluna valor_liquido e' gerada pelo banco; a
+// conta local aqui e' so' a rede de seguranca para fatura antiga sem a coluna.
+function liquidoDe(fat) {
+  if (fat && fat.valor_liquido != null) return Number(fat.valor_liquido);
+  return Number((Number(fat.valor || 0) - Number(fat.desconto || 0) + Number(fat.acrescimo || 0)).toFixed(2));
+}
+
 // ---------- valor por extenso ----------
 // O modelo do posto traz "(QUATROCENTOS E SESSENTA E SETE REAIS E OITENTA E
 // NOVE CENTAVOS)". É o que dá à fatura peso de documento de cobrança.
@@ -122,13 +129,13 @@ function gerarFaturaPdf(fat, cli, emp, linhas) {
     rot("Vencimento", cx + 1.5, y + 9);
     val(dataBr(fat.vencimento), cx + 1.5, y + 12, 28, 8.5);
     rot("Valor R$", cx + 32, y + 9);
-    val(moeda(fat.valor), cx + 32, y + 12, 28, 10, "right");
+    val(moeda(liquidoDe(fat)), cx + 32, y + 12, 28, 10, "right");
     y += 16;
 
     // por extenso
     doc.rect(mm(L), mm(y), mm(W), mm(6)).stroke();
     doc.font("Helvetica").fontSize(7.5).fillColor("#000");
-    txt(`(${porExtenso(fat.valor)})`, L + 1.5, y + 1.8, { width: mm(W - 3) });
+    txt(`(${porExtenso(liquidoDe(fat))})`, L + 1.5, y + 1.8, { width: mm(W - 3) });
     y += 6;
 
     // ---------------- cliente ----------------
@@ -188,9 +195,10 @@ function gerarFaturaPdf(fat, cli, emp, linhas) {
 
     // ---------------- totalizadores ----------------
     const cT = R - 70;
-    const tot = [["Total produtos", fat.valor], ["Multa + juros + acréscimos", 0],
-                 ["Descontos Notas", 0], ["Sub Total", fat.valor],
-                 ["Despesa Acessória", 0], ["Desconto Manual", 0]];
+    const desc = Number(fat.desconto || 0), acr = Number(fat.acrescimo || 0);
+    const tot = [["Total produtos", fat.valor], ["Multa + juros + acréscimos", acr],
+                 ["Descontos Notas", 0], ["Sub Total", Number(fat.valor || 0) + acr],
+                 ["Despesa Acessória", 0], ["Desconto Manual", desc]];
     tot.forEach(([r, v], i) => {
       doc.font("Helvetica").fontSize(7.5).fillColor("#000");
       txt(r + ":", cT, y + i * 4.4, { width: mm(44), align: "right" });
@@ -201,7 +209,7 @@ function gerarFaturaPdf(fat, cli, emp, linhas) {
     linha(yTot, cT, R);
     doc.font("Helvetica-Bold").fontSize(10);
     txt("Total:", cT, yTot + 1.5, { width: mm(44), align: "right" });
-    txt(moeda(fat.valor), cT + 46, yTot + 1.5, { width: mm(22), align: "right" });
+    txt(moeda(liquidoDe(fat)), cT + 46, yTot + 1.5, { width: mm(22), align: "right" });
 
     // ---------------- resumo por produto ----------------
     const porProd = {};
