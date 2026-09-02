@@ -996,6 +996,10 @@ function _transporteEmail(par) {
   const de = String(par.cobranca_email_remetente || "").trim();
   const host = String(par.cobranca_smtp_host || "").trim();
   const senha = String(par.cobranca_smtp_senha || "");
+  // no provedor de e-mail comum o login E' o proprio endereco; num relay
+  // (Brevo/SendGrid/Mailgun) e' uma credencial a parte e o remetente continua
+  // sendo o e-mail do posto
+  const usuario = String(par.cobranca_smtp_usuario || "").trim() || de;
   if (!de || !host || !senha) throw new Error("e-mail de cobrança não configurado (Parâmetros)");
   // erro classico: digitar smtp@provedor.com.br. Falha no DNS com uma mensagem
   // que nao explica nada -- melhor recusar aqui, dizendo o que esta' errado.
@@ -1010,7 +1014,7 @@ function _transporteEmail(par) {
     t: nodemailer.createTransport({
       host, port: porta,
       secure: porta === 465,                // 465 = TLS direto; 587 = STARTTLS
-      auth: { user: de, pass: senha },
+      auth: { user: usuario, pass: senha },
       // o padrao do nodemailer e' 2 minutos pendurado. Quem esta' na tela nao
       // espera isso -- e "nao respondeu em 20s" ja' e' o diagnostico completo.
       connectionTimeout: 20000,
