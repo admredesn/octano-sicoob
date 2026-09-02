@@ -1330,8 +1330,26 @@ async function _supaUpload(bucket, caminho, buf, tipo) {
   return caminho;
 }
 
+// boleto registrado sem PDF no bucket: acontece com os emitidos antes do
+// arquivamento existir, e com qualquer falha de upload. O envio precisa do
+// arquivo, entao vale reconferir a cada rodada.
+async function _boletosSemPdf() {
+  try {
+    const faturas = await _supaGet(
+      "oct_faturas?boleto_pdf_path=is.null&select=id&limit=20");
+    for (const f of faturas) {
+      const tem = await _supaGet(
+        `oct_boletos?fatura_id=eq.${f.id}&status=eq.registrado&select=id&limit=1`);
+      if (tem.length) await _arquivarBoletoPdf(f.id);
+    }
+  } catch (e) {
+    console.error("[boletos] backfill pdf:", e.message);
+  }
+}
+
 async function _workerFaturasPdf() {
   try {
+    await _boletosSemPdf();
     const pend = await _supaGet(
       "oct_faturas?fatura_pdf_pedido_em=not.is.null&fatura_pdf_path=is.null" +
       "&select=id&order=fatura_pdf_pedido_em&limit=10");
