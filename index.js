@@ -877,6 +877,7 @@ async function _workerBoletos() {
       }
       const patch = r.patch || { status: "erro", erro: JSON.stringify(r.corpo || {}).slice(0, 900) };
       await _supaPatch(`oct_boletos?id=eq.${b.id}`, patch, "return=minimal");
+      if (patch.status === "registrado") await _arquivarBoletoPdf(b.fatura_id);
     }
   } catch (e) {
     console.error("[boletos] worker:", e.message);
@@ -1181,7 +1182,10 @@ async function _workerEnvios() {
     console.error("[envio] worker:", e.message);
   }
 }
-if (process.env.BOLETO_WORKER === "1") {
+// Envio pelo gateway DESLIGADO por padrao: o Railway bloqueia SMTP de saida
+// (465 e 587 dao timeout; do PC do posto abrem na hora). Quem envia e' o nucleo.
+// ENVIO_WORKER=1 religa isto se um dia a saida for liberada.
+if (process.env.BOLETO_WORKER === "1" && process.env.ENVIO_WORKER === "1") {
   setInterval(_workerEnvios, BOL_POLL * 1000);
   console.log(`[envio] worker de faturas ligado (a cada ${BOL_POLL}s)`);
 }
@@ -1284,6 +1288,33 @@ app.get("/fatura/pdf", async (req, res) => {
     res.status(500).json({ ok: false, erro: String(e.message || e) });
   }
 });
+
+// guarda o PDF do boleto no bucket e aponta a fatura para ele
+async function _arquivarBoletoPdf(faturaId) {
+  try {
+    if (!faturaId) return;
+    const fat = (await _supaGet(`oct_faturas?id=eq.${faturaId}&select=id,empresa_id,emissao,criado_em`))[0];
+    if (!fat) return;
+    const bol = (await _supaGet(
+      `oct_boletos?fatura_id=eq.${faturaId}&status=eq.registrado` +
+      `&select=nosso_numero,resposta&order=id.desc&limit=1`))[0];
+    if (!bol) return;
+    const dados = (bol.resposta && (bol.resposta.resultado || bol.resposta)) || {};
+    if (!dados.linhaDigitavel) return;      // sem retorno do banco nao ha' boleto
+    const conta = (await _supaGet(`oct_sicoob_contas?empresa_id=eq.${fat.empresa_id}&select=*`))[0] || {};
+    const emp = (await _supaGet(
+      `oct_empresas?id=eq.${fat.empresa_id}&select=nome,cnpj,endereco,cidade,uf,cep`))[0] || {};
+    const pdf = await gerarBoletoPdf(dados, conta, emp);
+    const d = String(fat.emissao || fat.criado_em || new Date().toISOString()).slice(0, 10);
+    const caminho = `${fat.empresa_id}/${d.slice(0, 4)}/${d.slice(5, 7)}/boleto-${bol.nosso_numero}.pdf`;
+    await _supaUpload("octano-documentos", caminho, pdf, "application/pdf");
+    await _supaPatch(`oct_faturas?id=eq.${faturaId}`, { boleto_pdf_path: caminho }, "return=minimal");
+    console.log("[boletos] pdf arquivado:", caminho);
+  } catch (e) {
+    // nao derruba o registro do boleto: o titulo no banco e' o que importa
+    console.error("[boletos] arquivar pdf:", e.message);
+  }
+}
 
 // ---------- WORKER: gera a fatura pedida pela tela e arquiva na nuvem ----------
 // O caminho segue a convencao dos documentos fiscais:
