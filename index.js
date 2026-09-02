@@ -745,6 +745,22 @@ async function registrarBoleto(fatura_id, opts) {
       // DIAGNOSTICO: o mesmo client_id/certificado autentica no escopo do
       // EXTRATO? Se sim, credencial esta' boa e o que falta e' o PRODUTO de
       // cobranca na aplicacao do portal. Se nao, o problema e' client_id/cert.
+      // QUAL certificado o gateway esta' mandando? O Sicoob amarra o client_id ao
+      // certificado usado no cadastro da aplicacao -- se o Railway manda outro
+      // (ou um vencido), o erro e' invalid_client mesmo com a aplicacao ATIVA.
+      let certInfo = "sem certificado";
+      try {
+        const pfx = conta.env_prefix || "";
+        const pem = process.env[`SICOOB_CERT_PEM_B64_${pfx}`];
+        const bruto = pem ? Buffer.from(pem, "base64") : (CFG.pfxB64 ? null : null);
+        if (bruto) {
+          const x = new crypto.X509Certificate(bruto);
+          certInfo = `${x.subject.replace(/
+/g, " ").slice(0, 90)} | vale ate ${x.validTo}`;
+        } else {
+          certInfo = `SICOOB_CERT_PEM_B64_${pfx} NAO existe -> caiu no certificado GLOBAL`;
+        }
+      } catch (e3) { certInfo = "erro ao ler certificado: " + String(e3.message).slice(0, 80); }
       let diag = "nao testado";
       try {
         const b2 = new URLSearchParams({ grant_type: "client_credentials",
@@ -762,7 +778,8 @@ async function registrarBoleto(fatura_id, opts) {
       return { http: 401, corpo: { ok: false, erro: "Sicoob não autorizou o token de cobrança",
                                    detalhe: det, diagnostico: diag },
                patch: { status: "erro",
-                        erro: ("TOKEN: " + JSON.stringify(det) + " | DIAG: " + diag).slice(0, 900) } };
+                        erro: ("TOKEN: " + JSON.stringify(det) + " | DIAG: " + diag +
+                               " | CERT: " + certInfo).slice(0, 900) } };
     }
   }
 
