@@ -755,8 +755,7 @@ async function registrarBoleto(fatura_id, opts) {
         const bruto = pem ? Buffer.from(pem, "base64") : (CFG.pfxB64 ? null : null);
         if (bruto) {
           const x = new crypto.X509Certificate(bruto);
-          certInfo = `${x.subject.replace(/
-/g, " ").slice(0, 90)} | vale ate ${x.validTo}`;
+          certInfo = String(x.subject).split(String.fromCharCode(10)).join(" ").slice(0, 90) + " | vale ate " + x.validTo;
         } else {
           certInfo = `SICOOB_CERT_PEM_B64_${pfx} NAO existe -> caiu no certificado GLOBAL`;
         }
