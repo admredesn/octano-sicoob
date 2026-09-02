@@ -991,24 +991,38 @@ function _corpoEmail(fat, emp, anexos) {
   };
 }
 
-async function _enviarEmail(par, fat, cli, emp, anexos) {
+// monta o transporte SMTP a partir dos Parametros do posto
+function _transporteEmail(par) {
   const de = String(par.cobranca_email_remetente || "").trim();
   const host = String(par.cobranca_smtp_host || "").trim();
   const senha = String(par.cobranca_smtp_senha || "");
-  const para = String(cli.email || "").trim();
   if (!de || !host || !senha) throw new Error("e-mail de cobrança não configurado (Parâmetros)");
-  if (!para) throw new Error("cliente sem e-mail no cadastro");
-
+  // erro classico: digitar smtp@provedor.com.br. Falha no DNS com uma mensagem
+  // que nao explica nada -- melhor recusar aqui, dizendo o que esta' errado.
+  if (/[@\s]/.test(host))
+    throw new Error(`servidor SMTP inválido: "${host}". Deve ser um endereço de servidor ` +
+                    `(ex.: smtp.terra.com.br), sem @ e sem espaços.`);
   const porta = Number(par.cobranca_smtp_porta || 587);
-  const t = nodemailer.createTransport({
-    host, port: porta,
-    secure: porta === 465,                  // 465 = TLS direto; 587 = STARTTLS
-    auth: { user: de, pass: senha },
-  });
+  return {
+    de,
+    porta,
+    remetente: par.cobranca_email_nome ? `"${par.cobranca_email_nome}" <${de}>` : de,
+    t: nodemailer.createTransport({
+      host, port: porta,
+      secure: porta === 465,                // 465 = TLS direto; 587 = STARTTLS
+      auth: { user: de, pass: senha },
+    }),
+  };
+}
+
+async function _enviarEmail(par, fat, cli, emp, anexos) {
+  const para = String(cli.email || "").trim();
+  if (!para) throw new Error("cliente sem e-mail no cadastro");
+  const { remetente, t } = _transporteEmail(par);
   const c = _corpoEmail(fat, emp, anexos);
   const copia = String(par.cobranca_email_copia || "").trim();
   await t.sendMail({
-    from: par.cobranca_email_nome ? `"${par.cobranca_email_nome}" <${de}>` : de,
+    from: remetente,
     to: para, cc: copia || undefined, subject: c.assunto, text: c.texto, html: c.html,
     attachments: anexos.map(a => ({ filename: a.nome, content: a.buf, contentType: a.tipo })),
   });
@@ -1087,6 +1101,56 @@ app.post("/fatura/enviar", async (req, res) => {
     res.status(500).json({ ok: false, erro: String(e.message || e) });
   }
 });
+
+// ---------- TESTE DE E-MAIL (Parametros) ----------
+// verify() conecta e autentica ANTES de mandar: separa "senha errada" de
+// "servidor recusou a mensagem", que sao problemas diferentes.
+async function _testarEmail(empresaId, destino) {
+  const par = await _paramsCobranca(empresaId);
+  const { de, porta, remetente, t } = _transporteEmail(par);
+  await t.verify();
+  const emp = (await _supaGet(`oct_empresas?id=eq.${empresaId}&select=nome,nome_fantasia`))[0] || {};
+  const posto = emp.nome_fantasia || emp.nome || "o posto";
+  const para = String(destino || de).trim();
+  const r = await t.sendMail({
+    from: remetente, to: para,
+    subject: `Teste de envio — ${posto}`,
+    text: `Se você está lendo isto, o e-mail de cobrança do ${posto} está funcionando.\n\n` +
+          `Remetente: ${de}\nPorta: ${porta}\n\nOctano Sistemas`,
+    html: `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222">
+      <p>Se você está lendo isto, o <b>e-mail de cobrança do ${posto}</b> está funcionando.</p>
+      <p style="color:#666;font-size:12px">Remetente: ${de} · porta ${porta}<br>
+      Mensagem automática do Octano Sistemas — não precisa responder.</p></div>`,
+  });
+  return { para, detalhe: String((r && r.response) || "aceito pelo servidor").slice(0, 300) };
+}
+
+async function _workerTesteEmail() {
+  try {
+    const pend = await _supaGet(
+      "oct_email_testes?status=eq.pendente&select=id,empresa_id,destino&order=criado_em&limit=5");
+    for (const p of pend) {
+      let patch;
+      try {
+        const r = await _testarEmail(p.empresa_id, p.destino);
+        patch = { status: "ok", detalhe: r.detalhe, destino: r.para,
+                  erro: null, respondido_em: new Date().toISOString() };
+      } catch (e) {
+        // a mensagem do servidor e' o que resolve o problema: vai inteira
+        const det = (e && e.response) ? " | servidor: " + String(e.response) : "";
+        patch = { status: "erro", respondido_em: new Date().toISOString(),
+                  erro: (String(e.message || e) + det).slice(0, 900) };
+      }
+      await _supaPatch(`oct_email_testes?id=eq.${p.id}`, patch, "return=minimal");
+    }
+  } catch (e) {
+    console.error("[teste-email] worker:", e.message);
+  }
+}
+if (process.env.BOLETO_WORKER === "1") {
+  setInterval(_workerTesteEmail, 5000);   // teste e' interativo: resposta rapida
+  console.log("[teste-email] worker ligado (a cada 5s)");
+}
 
 async function _workerEnvios() {
   try {
