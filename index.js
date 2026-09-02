@@ -892,6 +892,228 @@ if (process.env.BOLETO_WORKER === "1") {
   console.log(`[fatura-pdf] worker ligado (a cada ${BOL_POLL}s)`);
 }
 
+// ============================================================
+// ENVIO DA FATURA AO CLIENTE (e-mail + WhatsApp)
+// ------------------------------------------------------------
+// A tela marca envio_pedido_em na fatura; quem envia e' aqui, porque a senha do
+// SMTP e o token do WhatsApp nao podem chegar ao navegador.
+//
+// O que vai: FATURA (extrato), BOLETO (se registrado), NF-e em PDF e o XML.
+// Por e-mail vao os quatro -- o XML e' o documento fiscal de verdade e o
+// contador do cliente pede. Por WhatsApp vao so' os PDFs: XML no WhatsApp nao
+// serve para nada a quem le' no celular.
+// ============================================================
+const nodemailer = require("nodemailer");
+
+async function _supaDownload(bucket, caminho) {
+  const r = await axios.get(
+    `${CFG.supaUrl}/storage/v1/object/${bucket}/${caminho}`,
+    { headers: { apikey: CFG.supaKey, Authorization: "Bearer " + CFG.supaKey },
+      responseType: "arraybuffer", timeout: 45000 });
+  return Buffer.from(r.data);
+}
+
+// parametros de cobranca do posto (oct_parametros)
+async function _paramsCobranca(empresaId) {
+  const rows = await _supaGet(
+    `oct_parametros?empresa_id=eq.${empresaId}&chave=like.cobranca*&select=chave,valor`);
+  const p = {};
+  (rows || []).forEach(r => { p[r.chave] = r.valor; });
+  return p;
+}
+
+function _txtValor(v) {
+  return Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function _txtData(d) {
+  const s = String(d || "").slice(0, 10);
+  return s ? `${s.slice(8, 10)}/${s.slice(5, 7)}/${s.slice(0, 4)}` : "—";
+}
+
+// junta os anexos que existirem. Falta de um nao impede o envio dos outros --
+// cobranca atrasada por falta de DANFE seria pior que cobranca sem DANFE.
+async function _anexosDaFatura(fat) {
+  const anexos = [];
+  const add = (nome, buf, tipo) => { if (buf && buf.length) anexos.push({ nome, buf, tipo }); };
+  const nome = fat.numero || fat.id;
+
+  if (fat.fatura_pdf_path) {
+    try { add(`fatura-${nome}.pdf`, await _supaDownload("octano-documentos", fat.fatura_pdf_path), "application/pdf"); }
+    catch (e) { /* segue sem */ }
+  }
+  // boleto: gerado na hora a partir do retorno do banco (nao fica em disco)
+  try {
+    const bol = (await _supaGet(
+      `oct_boletos?fatura_id=eq.${fat.id}&status=in.(registrado,liquidado)` +
+      `&select=nosso_numero,resposta&order=id.desc&limit=1`))[0];
+    if (bol) {
+      const dados = (bol.resposta && (bol.resposta.resultado || bol.resposta)) || {};
+      if (dados.linhaDigitavel) {
+        const conta = (await _supaGet(`oct_sicoob_contas?empresa_id=eq.${fat.empresa_id}&select=*`))[0] || {};
+        const emp = (await _supaGet(
+          `oct_empresas?id=eq.${fat.empresa_id}&select=nome,cnpj,endereco,cidade,uf,cep`))[0] || {};
+        add(`boleto-${bol.nosso_numero}.pdf`, await gerarBoletoPdf(dados, conta, emp), "application/pdf");
+      }
+    }
+  } catch (e) { /* segue sem */ }
+
+  if (fat.nfe_pdf_path) {
+    try { add(`nfe-${fat.nfe_numero || ""}.pdf`, await _supaDownload("octano-documentos", fat.nfe_pdf_path), "application/pdf"); }
+    catch (e) { /* segue sem */ }
+  }
+  if (fat.nfe_xml_path) {
+    try { add(`nfe-${fat.nfe_numero || ""}.xml`, await _supaDownload("octano-documentos", fat.nfe_xml_path), "application/xml"); }
+    catch (e) { /* segue sem */ }
+  }
+  return anexos;
+}
+
+function _corpoEmail(fat, emp, anexos) {
+  const posto = emp.nome_fantasia || emp.nome || "seu posto";
+  const lista = anexos.map(a => `<li>${a.nome}</li>`).join("");
+  return {
+    assunto: `Fatura ${fat.numero || ""} — ${posto} — vence ${_txtData(fat.vencimento)}`,
+    html: `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222">
+      <p>Olá, ${fat.cliente_nome || ""}.</p>
+      <p>Segue a fatura dos abastecimentos no <b>${posto}</b>.</p>
+      <table cellpadding="4" style="border-collapse:collapse;margin:12px 0">
+        <tr><td style="color:#666">Fatura</td><td><b>${fat.numero || "—"}</b></td></tr>
+        <tr><td style="color:#666">Valor</td><td><b>R$ ${_txtValor(fat.valor_liquido != null ? fat.valor_liquido : fat.valor)}</b></td></tr>
+        <tr><td style="color:#666">Vencimento</td><td><b>${_txtData(fat.vencimento)}</b></td></tr>
+      </table>
+      ${anexos.length ? `<p>Em anexo:</p><ul>${lista}</ul>` : ""}
+      <p style="color:#666;font-size:12px">Qualquer divergência, é só responder este e-mail.</p>
+      <p style="color:#666;font-size:12px">${posto}</p></div>`,
+    texto: `Fatura ${fat.numero || ""} — ${posto}\n` +
+           `Valor: R$ ${_txtValor(fat.valor_liquido != null ? fat.valor_liquido : fat.valor)}\n` +
+           `Vencimento: ${_txtData(fat.vencimento)}\n\n` +
+           `Segue em anexo a fatura detalhada dos abastecimentos.`,
+  };
+}
+
+async function _enviarEmail(par, fat, cli, emp, anexos) {
+  const de = String(par.cobranca_email_remetente || "").trim();
+  const host = String(par.cobranca_smtp_host || "").trim();
+  const senha = String(par.cobranca_smtp_senha || "");
+  const para = String(cli.email || "").trim();
+  if (!de || !host || !senha) throw new Error("e-mail de cobrança não configurado (Parâmetros)");
+  if (!para) throw new Error("cliente sem e-mail no cadastro");
+
+  const porta = Number(par.cobranca_smtp_porta || 587);
+  const t = nodemailer.createTransport({
+    host, port: porta,
+    secure: porta === 465,                  // 465 = TLS direto; 587 = STARTTLS
+    auth: { user: de, pass: senha },
+  });
+  const c = _corpoEmail(fat, emp, anexos);
+  const copia = String(par.cobranca_email_copia || "").trim();
+  await t.sendMail({
+    from: par.cobranca_email_nome ? `"${par.cobranca_email_nome}" <${de}>` : de,
+    to: para, cc: copia || undefined, subject: c.assunto, text: c.texto, html: c.html,
+    attachments: anexos.map(a => ({ filename: a.nome, content: a.buf, contentType: a.tipo })),
+  });
+  return para;
+}
+
+async function _enviarWhats(fat, cli, emp, anexos) {
+  if (!process.env.WPP_URL || !process.env.WPP_TOKEN) throw new Error("WhatsApp não configurado no gateway");
+  const tel = String(cli.whatsapp || cli.telefone || "").trim();
+  if (!tel) throw new Error("cliente sem WhatsApp/telefone no cadastro");
+  const base = process.env.WPP_URL.replace(/\/$/, "");
+  const H = { "Content-Type": "application/json", "x-wpp-token": process.env.WPP_TOKEN };
+  const posto = emp.nome_fantasia || emp.nome || "seu posto";
+  const msg = `*Fatura ${fat.numero || ""} — ${posto}*\n\n` +
+              `Valor: *R$ ${_txtValor(fat.valor_liquido != null ? fat.valor_liquido : fat.valor)}*\n` +
+              `Vencimento: *${_txtData(fat.vencimento)}*\n\n` +
+              `Segue a fatura detalhada dos abastecimentos.`;
+  await axios.post(base + "/send-text", { phone: tel, message: msg }, { headers: H, timeout: 30000 });
+  // XML fora: no celular ele nao abre nem serve para nada
+  for (const a of anexos.filter(x => x.tipo === "application/pdf")) {
+    await axios.post(base + "/send-document", {
+      phone: tel, document: a.buf.toString("base64"), fileName: a.nome, mimetype: a.tipo,
+    }, { headers: H, timeout: 60000 });
+  }
+  return tel;
+}
+
+async function enviarFatura(faturaId) {
+  const fat = (await _supaGet(`oct_faturas?id=eq.${faturaId}&select=*`))[0];
+  if (!fat) throw new Error("fatura não encontrada");
+  const par = await _paramsCobranca(fat.empresa_id);
+  if (par.cobranca_envio_ativo === false)
+    throw new Error("envio de fatura desligado nos Parâmetros do posto");
+
+  const cli = fat.cliente_id
+    ? (await _supaGet(`oct_pessoas?id=eq.${fat.cliente_id}&select=nome,email,telefone,whatsapp`))[0] || {}
+    : {};
+  const emp = (await _supaGet(
+    `oct_empresas?id=eq.${fat.empresa_id}&select=nome,nome_fantasia,cnpj`))[0] || {};
+
+  const anexos = await _anexosDaFatura(fat);
+  if (!anexos.length) throw new Error("nenhum documento para enviar (fatura sem PDF)");
+
+  const quer = String(fat.envio_canais || "ambos");
+  const querEmail = quer === "email" || quer === "ambos";
+  const querWhats = (quer === "whatsapp" || quer === "ambos") && par.cobranca_whatsapp !== false;
+
+  const feitos = [], destinos = [], erros = [];
+  if (querEmail) {
+    try { destinos.push(await _enviarEmail(par, fat, cli, emp, anexos)); feitos.push("email"); }
+    catch (e) { erros.push("e-mail: " + String(e.message || e)); }
+  }
+  if (querWhats) {
+    try { destinos.push(await _enviarWhats(fat, cli, emp, anexos)); feitos.push("whatsapp"); }
+    catch (e) { erros.push("whatsapp: " + String(e.message || e)); }
+  }
+  // um canal que deu certo ja' e' entrega. O erro do outro fica registrado para
+  // o operador ver na tela em vez de sumir.
+  if (!feitos.length) throw new Error(erros.join(" | ") || "nenhum canal habilitado");
+  return {
+    enviada_em: new Date().toISOString(),
+    enviada_por: feitos.join("+"),
+    envio_destino: destinos.join(", ").slice(0, 300),
+    envio_erro: erros.length ? erros.join(" | ").slice(0, 900) : null,
+    envio_pedido_em: null,
+    anexos: anexos.map(a => a.nome),
+  };
+}
+
+app.post("/fatura/enviar", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try {
+    const r = await enviarFatura((req.body || {}).fatura_id);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: String(e.message || e) });
+  }
+});
+
+async function _workerEnvios() {
+  try {
+    const pend = await _supaGet(
+      "oct_faturas?envio_pedido_em=not.is.null&enviada_em=is.null" +
+      "&select=id&order=envio_pedido_em&limit=5");
+    for (const p of pend) {
+      try {
+        const r = await enviarFatura(p.id);
+        delete r.anexos;
+        await _supaPatch(`oct_faturas?id=eq.${p.id}`, r, "return=minimal");
+      } catch (e) {
+        await _supaPatch(`oct_faturas?id=eq.${p.id}`,
+          { envio_pedido_em: null, envio_erro: String(e.message || e).slice(0, 900) },
+          "return=minimal");
+      }
+    }
+  } catch (e) {
+    console.error("[envio] worker:", e.message);
+  }
+}
+if (process.env.BOLETO_WORKER === "1") {
+  setInterval(_workerEnvios, BOL_POLL * 1000);
+  console.log(`[envio] worker de faturas ligado (a cada ${BOL_POLL}s)`);
+}
+
+
 // GET /boleto/pdf?empresa_id=..&nosso_numero=..  -> application/pdf
 // O desenho vive em boleto_pdf.js. A tela do retaguarda imprime do HTML dela;
 // esta rota existe para o ENVIO, que precisa de um arquivo de verdade.
