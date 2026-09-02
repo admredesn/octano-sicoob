@@ -742,10 +742,27 @@ async function registrarBoleto(fatura_id, opts) {
       token = await _tokenCobranca(conta);
     } catch (e) {
       const det = e.response?.data || e.message;
+      // DIAGNOSTICO: o mesmo client_id/certificado autentica no escopo do
+      // EXTRATO? Se sim, credencial esta' boa e o que falta e' o PRODUTO de
+      // cobranca na aplicacao do portal. Se nao, o problema e' client_id/cert.
+      let diag = "nao testado";
+      try {
+        const b2 = new URLSearchParams({ grant_type: "client_credentials",
+                                         client_id: conta.client_id, scope: EXT.scope });
+        await axios.post(CFG.tokenUrl, b2.toString(), {
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          httpsAgent: _agentePrefix(conta.env_prefix || ""), timeout: 30000,
+        });
+        diag = "credencial OK no escopo do EXTRATO -> falta o produto/escopo de COBRANCA na aplicacao";
+      } catch (e2) {
+        diag = "falhou tambem no escopo do EXTRATO (" +
+               JSON.stringify(e2.response?.data || e2.message).slice(0, 160) +
+               ") -> client_id ou certificado";
+      }
       return { http: 401, corpo: { ok: false, erro: "Sicoob não autorizou o token de cobrança",
-                                   detalhe: det },
+                                   detalhe: det, diagnostico: diag },
                patch: { status: "erro",
-                        erro: ("TOKEN: " + JSON.stringify(det)).slice(0, 900) } };
+                        erro: ("TOKEN: " + JSON.stringify(det) + " | DIAG: " + diag).slice(0, 900) } };
     }
   }
 
