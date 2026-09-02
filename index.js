@@ -699,6 +699,8 @@ function _montarBoleto(conta, fatura, pagador, nossoNumero) {
     valorJurosMora: Number(conta.juros_valor || 0),
     tipoMulta: Number(conta.multa_tipo != null ? conta.multa_tipo : 0),
     valorMulta: Number(conta.multa_valor || 0),
+    //   tipoDesconto: 0=ISENTO 1=valor fixo 2=percentual 3..6=por antecipacao
+    tipoDesconto: Number(conta.desconto_tipo != null ? conta.desconto_tipo : 0),
     pagador: {
       numeroCpfCnpj: doc,
       nome: String(pagador.nome || "").slice(0, 50),
