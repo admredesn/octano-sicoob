@@ -736,8 +736,11 @@ async function registrarBoleto(fatura_id, opts) {
   };
 
   if (COB.dryRun) {
+    // grava o PAYLOAD em `resposta`: no dry-run pelo worker o retorno HTTP e'
+    // descartado, e sem isto a simulacao nao mostraria nada de util.
     return { http: 200, corpo: { ok: true, dry_run: true, corpo_que_seria_enviado: corpo },
-             patch: { ...patch, status: "erro", erro: "COBRANCA_DRY_RUN ligado — não foi ao banco" } };
+             patch: { ...patch, status: "simulado", erro: "COBRANCA_DRY_RUN ligado — não foi ao banco",
+                      resposta: { dry_run: true, payload: corpo } } };
   }
 
   const base = (conta.ambiente || "producao") === "sandbox" ? COB.urlSandbox : COB.urlProd;
