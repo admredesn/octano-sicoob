@@ -691,6 +691,14 @@ function _montarBoleto(conta, fatura, pagador, nossoNumero) {
     valor: Number(fatura.valor),
     dataVencimento: String(fatura.vencimento).slice(0, 10),
     numeroParcela: 1,
+    // JUROS E MULTA (obrigatorio -- erro 5002 sem isto).
+    //   tipoJurosMora: 1=valor/dia  2=taxa mensal  3=ISENTO
+    //   tipoMulta:     0=ISENTO     1=valor fixo   2=percentual
+    // Padrao isento: encargo e' decisao do posto. Configuravel por conta.
+    tipoJurosMora: Number(conta.juros_tipo != null ? conta.juros_tipo : 3),
+    valorJurosMora: Number(conta.juros_valor || 0),
+    tipoMulta: Number(conta.multa_tipo != null ? conta.multa_tipo : 0),
+    valorMulta: Number(conta.multa_valor || 0),
     pagador: {
       numeroCpfCnpj: doc,
       nome: String(pagador.nome || "").slice(0, 50),
