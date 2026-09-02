@@ -463,20 +463,46 @@ async function _extratoConta(conta, mes, ano, diaIni, diaFim) {
   return d.transacoes || d.resultado?.transacoes || [];
 }
 
-async function importarExtratos() {
-  if (!CFG.supaUrl || !CFG.supaKey) return { erro: "Supabase não configurado" };
-  const res = { contas: 0, gravados: 0, lidos: 0 };
-  const contas = await _supaGet("oct_sicoob_contas?ativo=eq.true&select=*");
-  const hoje = new Date();
-  const ini = new Date(hoje.getTime() - EXT.dias * 864e5);
-  // janelas por mês (a consulta é mensal; virada de mês vira 2 chamadas)
+// Monta as janelas MENSAIS que a API do Sicoob exige (a consulta é por mês,
+// com diaInicial/diaFinal). Um período de 3 meses vira 3 chamadas por conta.
+function _janelasPeriodo(dIni, dFim) {
   const janelas = [];
-  if (ini.getMonth() === hoje.getMonth() && ini.getFullYear() === hoje.getFullYear()) {
-    janelas.push({ mes: hoje.getMonth() + 1, ano: hoje.getFullYear(), d1: ini.getDate(), d2: hoje.getDate() });
+  let ano = dIni.getFullYear(), mes = dIni.getMonth();
+  while (ano < dFim.getFullYear() || (ano === dFim.getFullYear() && mes <= dFim.getMonth())) {
+    const primeiro = (ano === dIni.getFullYear() && mes === dIni.getMonth()) ? dIni.getDate() : 1;
+    const ultimoDoMes = new Date(ano, mes + 1, 0).getDate();
+    const ultimo = (ano === dFim.getFullYear() && mes === dFim.getMonth()) ? dFim.getDate() : ultimoDoMes;
+    janelas.push({ mes: mes + 1, ano, d1: primeiro, d2: ultimo });
+    mes++;
+    if (mes > 11) { mes = 0; ano++; }
+    if (janelas.length > 36) break;      // trava: no máximo 3 anos por chamada
+  }
+  return janelas;
+}
+
+// opts.desde / opts.ate ("aaaa-mm-dd") importam um período fechado — usado para
+// buscar extrato ANTIGO, anterior ao início da importação automática. Sem opts,
+// mantém o comportamento de sempre: os últimos EXTRATO_DIAS.
+// opts.empresa limita a uma conta (o resto do grupo não é tocado).
+async function importarExtratos(opts) {
+  if (!CFG.supaUrl || !CFG.supaKey) return { erro: "Supabase não configurado" };
+  opts = opts || {};
+  const res = { contas: 0, gravados: 0, lidos: 0 };
+  let contas = await _supaGet("oct_sicoob_contas?ativo=eq.true&select=*");
+  if (opts.empresa) contas = contas.filter(c => c.empresa_id === opts.empresa);
+  const hoje = new Date();
+  let janelas;
+  if (opts.desde) {
+    const p = (t) => { const m = String(t).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null; };
+    const dIni = p(opts.desde), dFim = p(opts.ate) || hoje;
+    if (!dIni) return { erro: "desde inválido (use aaaa-mm-dd)" };
+    if (dFim < dIni) return { erro: "ate anterior a desde" };
+    janelas = _janelasPeriodo(dIni, dFim);
+    res.periodo = { desde: opts.desde, ate: opts.ate || null, janelas: janelas.length };
   } else {
-    const fimIni = new Date(ini.getFullYear(), ini.getMonth() + 1, 0).getDate();
-    janelas.push({ mes: ini.getMonth() + 1, ano: ini.getFullYear(), d1: ini.getDate(), d2: fimIni });
-    janelas.push({ mes: hoje.getMonth() + 1, ano: hoje.getFullYear(), d1: 1, d2: hoje.getDate() });
+    const ini = new Date(hoje.getTime() - EXT.dias * 864e5);
+    janelas = _janelasPeriodo(ini, hoje);
   }
   for (const conta of contas) {
     res.contas++;
@@ -540,6 +566,7 @@ app.get("/status", (req, res) => {
   res.json({
     ok: true, ambiente: CFG.ambiente, dry_run: CFG.dryRun, worker_ativo: CFG.workerAtivo, poll_seg: CFG.pollSeg,
     tem_certificado: !!CFG.pfxB64, tem_client_id: !!CFG.clientId, pix_pagar_configurado: !!CFG.pixPagarUrl,
+    cobranca: { escopo: COB.scope, dry_run: COB.dryRun },
     supabase_ok: !!(CFG.supaUrl && CFG.supaKey), caps: { por_pix: CFG.capPorPix, diario: CFG.capDiario }, gasto_hoje: _gastoHoje(),
   });
 });
@@ -564,11 +591,247 @@ app.get("/extrato/status", (req, res) => {
 });
 
 // POST /extrato/sync → importa os extratos agora (teste/manual)
+//   sem corpo            = últimos EXTRATO_DIAS (o de sempre)
+//   {desde,ate,empresa}  = período fechado, para buscar extrato ANTIGO
+// Aceita também por querystring: /extrato/sync?desde=2026-03-01&ate=2026-06-30
 app.post("/extrato/sync", async (req, res) => {
   if (!checaToken(req, res)) return;
-  try { res.json(await importarExtratos()); }
+  const q = Object.assign({}, req.query || {}, req.body || {});
+  try { res.json(await importarExtratos({ desde: q.desde, ate: q.ate, empresa: q.empresa })); }
   catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
+
+// ============================================================
+// COBRANÇA BANCÁRIA — registro de BOLETO (Sicoob API v3)
+// ------------------------------------------------------------
+// O Faturar agrupa notas a prazo numa fatura; aqui essa fatura vira um boleto
+// REGISTRADO no banco. Boleto sem registro não é pago nem baixa — por isso o
+// registro é o passo que importa, não o desenho do papel.
+//
+// Reaproveita o que o extrato já montou: conta por posto em oct_sicoob_contas,
+// certificado mTLS por prefixo (SICOOB_CERT_PEM_B64_<PREFIX>) e token OAuth.
+// O que muda é o ESCOPO: cobrança é outro produto no portal do Sicoob.
+//
+// Envs: SICOOB_COBRANCA_SCOPE (padrão abaixo), COBRANCA_DRY_RUN=1 para simular.
+// ============================================================
+const COB = {
+  urlSandbox: "https://sandbox.sicoob.com.br/sicoob/sandbox/cobranca-bancaria/v3",
+  urlProd: "https://api.sicoob.com.br/cobranca-bancaria/v3",
+  scope: process.env.SICOOB_COBRANCA_SCOPE ||
+         "boletos_inclusao boletos_consulta boletos_alteracao",
+  dryRun: process.env.COBRANCA_DRY_RUN !== "0",   // por padrão NÃO chama o banco
+};
+
+const _tokCob = {};
+async function _tokenCobranca(conta) {
+  if ((conta.ambiente || "producao") === "sandbox") return CFG.sandboxToken;
+  const k = "cob:" + conta.empresa_id;
+  const c = _tokCob[k];
+  if (c && Date.now() < c.exp - 30000) return c.tok;
+  const body = new URLSearchParams({
+    grant_type: "client_credentials", client_id: conta.client_id, scope: COB.scope,
+  });
+  const r = await axios.post(CFG.tokenUrl, body.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    httpsAgent: _agentePrefix(conta.env_prefix || ""), timeout: 30000,
+  });
+  _tokCob[k] = { tok: r.data.access_token, exp: Date.now() + Number(r.data.expires_in || 300) * 1000 };
+  return _tokCob[k].tok;
+}
+
+function _so_digitos(v) { return String(v || "").replace(/\D/g, ""); }
+
+// O Sicoob recusa o registro (HTTP 400) quando falta dado do pagador. Conferir
+// ANTES economiza uma ida ao banco e devolve um erro que o operador entende.
+function _validarPagador(p) {
+  const faltas = [];
+  const doc = _so_digitos(p.documento);
+  if (doc.length !== 11 && doc.length !== 14) faltas.push("CPF/CNPJ");
+  if (!String(p.nome || "").trim()) faltas.push("nome");
+  if (!String(p.endereco || "").trim()) faltas.push("endereço");
+  if (!String(p.bairro || "").trim()) faltas.push("bairro");
+  if (!String(p.cidade || "").trim()) faltas.push("cidade");
+  if (_so_digitos(p.cep).length !== 8) faltas.push("CEP");
+  if (!String(p.uf || "").trim()) faltas.push("UF");
+  return faltas;
+}
+
+// Nosso número: sequencial DENTRO da faixa que o convênio reservou. Reservado de
+// forma atômica no banco (lê e grava o próximo) para dois boletos simultâneos
+// não pegarem o mesmo número — a UNIQUE de oct_boletos é a rede de segurança.
+async function _proximoNossoNumero(conta) {
+  const ini = Number(conta.nosso_numero_ini || 1);
+  const fim = Number(conta.nosso_numero_fim || 0);
+  const atual = Number(conta.nosso_numero_atual || 0);
+  const prox = Math.max(atual + 1, ini);
+  if (fim && prox > fim) throw new Error(`faixa de nosso número esgotada (${ini}-${fim})`);
+  await _supaPatch(`oct_sicoob_contas?empresa_id=eq.${conta.empresa_id}`,
+                   { nosso_numero_atual: prox }, "return=minimal");
+  return prox;
+}
+
+function _montarBoleto(conta, fatura, pagador, nossoNumero) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const doc = _so_digitos(pagador.documento);
+  return {
+    numeroCliente: Number(conta.numero_cliente),
+    codigoModalidade: Number(conta.cobranca_modalidade || 1),
+    numeroContaCorrente: Number(_so_digitos(conta.numero_conta)) || 0,
+    codigoEspecieDocumento: "DM",             // duplicata mercantil
+    dataEmissao: hoje,
+    nossoNumero: Number(nossoNumero),
+    seuNumero: String(fatura.numero || fatura.id || "").slice(0, 18),
+    identificacaoBoletoEmpresa: String(fatura.numero || "").slice(0, 25),
+    identificacaoEmissaoBoleto: 2,            // 2 = cliente emite
+    identificacaoDistribuicaoBoleto: 2,       // 2 = cliente distribui
+    valor: Number(fatura.valor),
+    dataVencimento: String(fatura.vencimento).slice(0, 10),
+    numeroParcela: 1,
+    pagador: {
+      numeroCpfCnpj: doc,
+      nome: String(pagador.nome || "").slice(0, 50),
+      endereco: String(pagador.endereco || "").slice(0, 40),
+      bairro: String(pagador.bairro || "").slice(0, 30),
+      cidade: String(pagador.cidade || "").slice(0, 30),
+      cep: _so_digitos(pagador.cep),
+      uf: String(pagador.uf || "").toUpperCase().slice(0, 2),
+      email: String(pagador.email || "").slice(0, 60) || undefined,
+    },
+  };
+}
+
+// Registra o boleto de UMA fatura. Devolve {http, corpo} para a rota e para o
+// worker responderem igual. Nunca lanca: erro vira linha 'erro' em oct_boletos,
+// para o operador ver na tela o motivo em vez de um silencio.
+async function registrarBoleto(fatura_id, opts) {
+  opts = opts || {};
+  const fat = (await _supaGet(`oct_faturas?id=eq.${fatura_id}&select=*`))[0];
+  if (!fat) return { http: 404, corpo: { ok: false, erro: "fatura não encontrada" } };
+  if (!fat.vencimento) return { http: 400, corpo: { ok: false, erro: "fatura sem vencimento" } };
+
+  const jaTem = (await _supaGet(
+    `oct_boletos?fatura_id=eq.${fatura_id}&status=in.(registrado,liquidado)&select=id,nosso_numero`))[0];
+  if (jaTem) return { http: 409, corpo: { ok: false, erro: "fatura já tem boleto registrado",
+                                          nosso_numero: jaTem.nosso_numero } };
+
+  const conta = (await _supaGet(
+    `oct_sicoob_contas?empresa_id=eq.${fat.empresa_id}&ativo=eq.true&select=*`))[0];
+  if (!conta) return { http: 400, corpo: { ok: false, erro: "posto sem conta Sicoob configurada" } };
+  if (!conta.cobranca_ativa || !conta.numero_cliente)
+    return { http: 400, corpo: { ok: false, erro: "convênio de cobrança não configurado para este posto",
+      detalhe: "faltam numero_cliente e/ou cobranca_ativa em oct_sicoob_contas" } };
+
+  const pag = (await _supaGet(`oct_pessoas?id=eq.${fat.cliente_id}&select=*`))[0];
+  if (!pag) return { http: 400, corpo: { ok: false, erro: "cliente da fatura não encontrado" } };
+  const faltas = _validarPagador(pag);
+  if (faltas.length)
+    return { http: 422, corpo: { ok: false, erro: "cadastro do cliente incompleto para boleto",
+                                 faltando: faltas, cliente: pag.nome } };
+
+  const nossoNumero = await _proximoNossoNumero(conta);
+  const corpo = _montarBoleto(conta, fat, pag, nossoNumero);
+  const patch = {
+    nosso_numero: String(nossoNumero), seu_numero: corpo.seuNumero,
+    numero_contrato: String(conta.numero_cliente), modalidade: corpo.codigoModalidade,
+  };
+
+  if (COB.dryRun) {
+    return { http: 200, corpo: { ok: true, dry_run: true, corpo_que_seria_enviado: corpo },
+             patch: { ...patch, status: "erro", erro: "COBRANCA_DRY_RUN ligado — não foi ao banco" } };
+  }
+
+  const base = (conta.ambiente || "producao") === "sandbox" ? COB.urlSandbox : COB.urlProd;
+  const token = await _tokenCobranca(conta);
+  try {
+    const resp = await axios.post(`${base}/boletos`, corpo, {
+      headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id,
+                 "Content-Type": "application/json" },
+      httpsAgent: (conta.ambiente || "producao") === "sandbox" ? undefined
+                                                               : _agentePrefix(conta.env_prefix || ""),
+      timeout: 40000,
+    });
+    const d = resp.data?.resultado || resp.data || {};
+    return { http: 200, corpo: { ok: true, nosso_numero: String(nossoNumero) }, patch: {
+      ...patch, status: "registrado", registrado_em: new Date().toISOString(),
+      linha_digitavel: d.linhaDigitavel || d.linha_digitavel || null,
+      codigo_barras: d.codigoBarras || d.codigo_barras || null,
+      pix_copia_cola: d.qrCode || d.pixCopiaECola || null,
+      resposta: resp.data, erro: null,
+    } };
+  } catch (e) {
+    const det = e.response?.data || e.message;
+    return { http: 502, corpo: { ok: false, erro: "Sicoob recusou o registro", detalhe: det },
+             patch: { ...patch, status: "erro", erro: JSON.stringify(det).slice(0, 900) } };
+  }
+}
+
+// POST /boleto/registrar { fatura_id }
+app.post("/boleto/registrar", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try {
+    const { fatura_id } = req.body || {};
+    if (!fatura_id) return res.status(400).json({ ok: false, erro: "fatura_id obrigatório" });
+    const r = await registrarBoleto(fatura_id);
+    if (r.patch) {
+      const linha = (await _supaGet(`oct_boletos?fatura_id=eq.${fatura_id}&order=id.desc&limit=1&select=id`))[0];
+      if (linha) await _supaPatch(`oct_boletos?id=eq.${linha.id}`, r.patch, "return=minimal");
+    }
+    res.status(r.http).json(r.corpo);
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: String(e.message || e) });
+  }
+});
+
+// ---------- WORKER: pega os boletos que a tela deixou 'pendente' ----------
+// A tela do Faturar so' INSERE a linha pendente; quem tem o certificado e' aqui.
+const BOL_POLL = Number(process.env.BOLETO_POLL_SEGUNDOS || 20);
+async function _workerBoletos() {
+  try {
+    const pend = await _supaGet(
+      "oct_boletos?status=eq.pendente&select=id,fatura_id&order=criado_em&limit=20");
+    for (const b of pend) {
+      let r;
+      try {
+        r = await registrarBoleto(b.fatura_id);
+      } catch (e) {
+        r = { patch: { status: "erro", erro: String(e.message || e).slice(0, 900) } };
+      }
+      const patch = r.patch || { status: "erro", erro: JSON.stringify(r.corpo || {}).slice(0, 900) };
+      await _supaPatch(`oct_boletos?id=eq.${b.id}`, patch, "return=minimal");
+    }
+  } catch (e) {
+    console.error("[boletos] worker:", e.message);
+  }
+}
+if (process.env.BOLETO_WORKER === "1") {
+  setInterval(_workerBoletos, BOL_POLL * 1000);
+  console.log(`[boletos] worker ligado (a cada ${BOL_POLL}s)`);
+}
+
+// GET /boleto/consultar?empresa_id=..&nosso_numero=..
+app.get("/boleto/consultar", async (req, res) => {
+  if (!checaToken(req, res)) return;
+  try {
+    const { empresa_id, nosso_numero } = req.query || {};
+    const conta = (await _supaGet(
+      `oct_sicoob_contas?empresa_id=eq.${empresa_id}&ativo=eq.true&select=*`))[0];
+    if (!conta) return res.status(400).json({ ok: false, erro: "posto sem conta Sicoob" });
+    const base = (conta.ambiente || "producao") === "sandbox" ? COB.urlSandbox : COB.urlProd;
+    const token = await _tokenCobranca(conta);
+    const r = await axios.get(`${base}/boletos?numeroCliente=${conta.numero_cliente}` +
+                              `&codigoModalidade=${conta.cobranca_modalidade || 1}` +
+                              `&nossoNumero=${nosso_numero}`, {
+      headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id },
+      httpsAgent: (conta.ambiente || "producao") === "sandbox" ? undefined
+                                                               : _agentePrefix(conta.env_prefix || ""),
+      timeout: 30000,
+    });
+    res.json({ ok: true, dados: r.data });
+  } catch (e) {
+    res.status(502).json({ ok: false, erro: e.response?.data || String(e.message || e) });
+  }
+});
+
 
 app.listen(CFG.porta, () => {
   console.log(`octano-sicoob on :${CFG.porta} [${CFG.ambiente}] dry_run=${CFG.dryRun} worker=${CFG.workerAtivo}`);
