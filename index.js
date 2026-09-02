@@ -635,7 +635,11 @@ async function _tokenCobranca(conta) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     httpsAgent: _agentePrefix(conta.env_prefix || ""), timeout: 30000,
   });
-  _tokCob[k] = { tok: r.data.access_token, exp: Date.now() + Number(r.data.expires_in || 300) * 1000 };
+  // guarda TAMBEM o escopo concedido: o Keycloak devolve token valido com os
+  // escopos que a aplicacao realmente tem, ignorando em silencio o que foi
+  // pedido. Sem isso, "produto nao assinado" parece erro de credencial.
+  _tokCob[k] = { tok: r.data.access_token, esc: r.data.scope || "",
+                 exp: Date.now() + Number(r.data.expires_in || 300) * 1000 };
   return _tokCob[k].tok;
 }
 
@@ -816,8 +820,15 @@ async function registrarBoleto(fatura_id, opts) {
     } };
   } catch (e) {
     const det = e.response?.data || e.message;
-    return { http: 502, corpo: { ok: false, erro: "Sicoob recusou o registro", detalhe: det },
-             patch: { ...patch, status: "erro", erro: JSON.stringify(det).slice(0, 900) } };
+    const esc = (_tokCob["cob:" + conta.empresa_id] || {}).esc || "(nao informado)";
+    const faltam = COB.scope.split(" ").filter(x => !esc.includes(x));
+    const nota = faltam.length
+      ? `token veio SEM ${faltam.join(", ")} -> o produto de Cobranca nao esta assinado nesta aplicacao`
+      : "token tem os escopos de cobranca -> o erro e' no payload/convenio";
+    return { http: 502, corpo: { ok: false, erro: "Sicoob recusou o registro", detalhe: det,
+                                 escopos_do_token: esc, diagnostico: nota },
+             patch: { ...patch, status: "erro",
+                      erro: (JSON.stringify(det) + " | ESCOPOS: " + esc + " | " + nota).slice(0, 900) } };
   }
 }
 
