@@ -894,6 +894,109 @@ if (process.env.BOLETO_WORKER === "1") {
 }
 
 // ============================================================
+// LIQUIDACAO: data REAL do pagamento do boleto (14/09/2026)
+// ------------------------------------------------------------
+// A baixa pelo extrato so' sabe quando o dinheiro ENTROU (credito_em). O Sicoob
+// credita em D+1 util: boletos que venceram num feriado e foram pagos no dia
+// util seguinte apareceriam "pagos com atraso" medidos pelo extrato. A data do
+// pagamento esta' na consulta do titulo.
+//
+// Para cada boleto registrado/liquidado ainda sem pago_em (no maximo 30 por
+// rodada, cada um reconsultado depois de 50 min):
+//   - guarda a resposta CRUA em consulta_sicoob (auditoria);
+//   - grava pago_em SO' quando reconhece a liquidacao E a data. Formato que nao
+//     bater com o esperado nao vira data inventada: fica so' a resposta crua,
+//     e o parser se ajusta olhando o dado real.
+// Liga com BOLETO_WORKER=1 (o mesmo dos outros workers de boleto);
+// BOLETO_CONSULTA=0 desliga so' este.
+// ============================================================
+const LIQ_POLL = Number(process.env.BOLETO_CONSULTA_SEGUNDOS || 3600);
+
+function _dataIso(v) {
+  const s = String(v || "");
+  let m = /^(\d{4}-\d{2}-\d{2})/.exec(s);
+  if (m) return m[1];
+  m = /^(\d{2})\/(\d{2})\/(\d{4})/.exec(s);
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
+}
+
+function _lerLiquidacao(dado) {
+  const b = (dado && (dado.resultado || dado)) || {};
+  const situacao = String(b.situacaoBoleto || b.situacao || "");
+  const hist = Array.isArray(b.listaHistorico) ? b.listaHistorico : [];
+  const liq = hist.filter(h => /liquida/i.test(String(h.descricaoHistorico || h.descricao || "")));
+  const pagoEm = _dataIso(b.dataLiquidacao) || _dataIso(b.dataPagamento) ||
+                 (liq.length ? _dataIso(liq[liq.length - 1].dataHistorico) : null);
+  const valor = [b.valorLiquidado, b.valorPago, b.valorRecebido]
+    .map(Number).find(n => Number.isFinite(n) && n > 0) || null;
+  return { liquidado: /liquidad/i.test(situacao) || liq.length > 0, pagoEm, valor, situacao };
+}
+
+// tira o PDF em base64 que algumas respostas trazem: consulta_sicoob e' para ler
+function _semPdf(dado) {
+  try {
+    const c = JSON.parse(JSON.stringify(dado || {}));
+    const alvo = c.resultado || c;
+    if (alvo && typeof alvo === "object") delete alvo.pdfBoleto;
+    return c;
+  } catch (e) { return null; }
+}
+
+async function _workerLiquidacao() {
+  try {
+    const limite = new Date(Date.now() - 50 * 60000).toISOString();
+    const lista = await _supaGet(
+      "oct_boletos?status=in.(registrado,liquidado)&pago_em=is.null&nosso_numero=not.is.null" +
+      `&or=(consultado_em.is.null,consultado_em.lt.${encodeURIComponent(limite)})` +
+      "&select=id,empresa_id,nosso_numero&order=vencimento&limit=30");
+    const contas = {};
+    for (const bol of lista) {
+      try {
+        if (!(bol.empresa_id in contas)) {
+          contas[bol.empresa_id] = (await _supaGet(
+            `oct_sicoob_contas?empresa_id=eq.${bol.empresa_id}&ativo=eq.true&select=*`))[0] || null;
+        }
+        const conta = contas[bol.empresa_id];
+        if (!conta || !conta.numero_cliente) continue;
+        const token = await _tokenCobranca(conta);
+        const base = (conta.ambiente || "producao") === "sandbox" ? COB.urlSandbox : COB.urlProd;
+        const q = `numeroCliente=${Number(conta.numero_cliente)}` +
+                  `&codigoModalidade=${Number(conta.cobranca_modalidade || 1)}` +
+                  `&nossoNumero=${Number(bol.nosso_numero)}`;
+        const r = await axios.get(`${base}/boletos?${q}`, {
+          headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id },
+          httpsAgent: _agentePrefix(conta.env_prefix || ""), timeout: 30000,
+          validateStatus: () => true,       // erro do banco tambem vai para consulta_sicoob
+        });
+        const patch = { consulta_sicoob: { http: r.status, corpo: _semPdf(r.data) },
+                        consultado_em: new Date().toISOString() };
+        if (r.status === 200) {
+          const l = _lerLiquidacao(r.data);
+          if (l.liquidado && l.pagoEm) {
+            patch.pago_em = l.pagoEm;
+            patch.status = "liquidado";
+            patch.liquidado_em = l.pagoEm + "T00:00:00+00:00";
+            patch.baixa_origem = "sicoob";
+            if (l.valor) patch.valor_pago = l.valor;
+            console.log(`[liquidacao] ${bol.nosso_numero} pago em ${l.pagoEm}`);
+          }
+        }
+        await _supaPatch(`oct_boletos?id=eq.${bol.id}`, patch, "return=minimal");
+      } catch (e) {
+        console.error("[liquidacao]", bol.nosso_numero, e.message);
+      }
+    }
+  } catch (e) {
+    console.error("[liquidacao] worker:", e.message);
+  }
+}
+if (process.env.BOLETO_WORKER === "1" && process.env.BOLETO_CONSULTA !== "0") {
+  setTimeout(_workerLiquidacao, 60000);
+  setInterval(_workerLiquidacao, LIQ_POLL * 1000);
+  console.log(`[liquidacao] worker ligado (a cada ${LIQ_POLL}s)`);
+}
+
+// ============================================================
 // ENVIO DA FATURA AO CLIENTE (e-mail + WhatsApp)
 // ------------------------------------------------------------
 // A tela marca envio_pedido_em na fatura; quem envia e' aqui, porque a senha do
