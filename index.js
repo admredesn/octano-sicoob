@@ -690,7 +690,11 @@ function _montarBoleto(conta, fatura, pagador, nossoNumero) {
     identificacaoBoletoEmpresa: String(fatura.numero || "").slice(0, 25),
     identificacaoEmissaoBoleto: 2,            // 2 = cliente emite
     identificacaoDistribuicaoBoleto: 2,       // 2 = cliente distribui
-    valor: Number(fatura.valor),
+    // LIQUIDO, nao bruto (14/09/2026): a fatura #12 do Bread Life levou desconto
+    // de R$ 773,13 as 12:23 e o boleto foi registrado as 12:24 com o valor CHEIO
+    // (R$ 14.426,31) -- a tabela guardou o liquido e o banco ficou com o bruto.
+    // Regra do projeto: quem manda na cobranca e' valor_liquido (coluna gerada).
+    valor: Number(fatura.valor_liquido != null ? fatura.valor_liquido : fatura.valor),
     dataVencimento: String(fatura.vencimento).slice(0, 10),
     numeroParcela: 1,
     // JUROS E MULTA (obrigatorio -- erro 5002 sem isto).
@@ -921,15 +925,35 @@ function _dataIso(v) {
 }
 
 function _lerLiquidacao(dado) {
+  // Formato REAL (consultado em 14/09/2026): situacaoBoleto "Liquidado" | "Em Aberto"
+  // | "Baixado", e listaHistorico com tipoHistorico + descricaoHistorico.
+  // CUIDADO com duas armadilhas vistas no dado real:
+  //  - tipoHistorico "6" e' LIQUIDACAO e tambem BAIXA ("BAIXA - PEDIDO CEDENTE");
+  //  - a TARIFA ("TAR. LIQUIDACAO TIT. REGISTRADO", tipo 4) tambem contem a palavra
+  //    liquidacao. So' vale a linha que COMECA com "LIQUIDA".
   const b = (dado && (dado.resultado || dado)) || {};
   const situacao = String(b.situacaoBoleto || b.situacao || "");
   const hist = Array.isArray(b.listaHistorico) ? b.listaHistorico : [];
-  const liq = hist.filter(h => /liquida/i.test(String(h.descricaoHistorico || h.descricao || "")));
-  const pagoEm = _dataIso(b.dataLiquidacao) || _dataIso(b.dataPagamento) ||
-                 (liq.length ? _dataIso(liq[liq.length - 1].dataHistorico) : null);
-  const valor = [b.valorLiquidado, b.valorPago, b.valorRecebido]
-    .map(Number).find(n => Number.isFinite(n) && n > 0) || null;
-  return { liquidado: /liquidad/i.test(situacao) || liq.length > 0, pagoEm, valor, situacao };
+  const desc = h => String(h.descricaoHistorico || h.descricao || "").trim();
+  const liq = hist.filter(h => /^liquida/i.test(desc(h)));
+  const bx = hist.filter(h => /^baixa/i.test(desc(h)));
+  const ultLiq = liq.length ? liq[liq.length - 1] : null;
+  // "LIQUIDACAO - LIQUIDACAO COBRANCA - INTERCREDIS - R$417,40"
+  let valor = null;
+  if (ultLiq) {
+    const m = /R\$\s*([\d.]+,\d{2})/.exec(desc(ultLiq));
+    if (m) valor = Number(m[1].replace(/\./g, "").replace(",", "."));
+  }
+  return {
+    liquidado: /liquidad/i.test(situacao) && !!ultLiq,
+    pagoEm: ultLiq ? _dataIso(ultLiq.dataHistorico) : null,
+    valor,
+    baixado: /baixad/i.test(situacao),
+    baixadoEm: bx.length ? _dataIso(bx[bx.length - 1].dataHistorico) : null,
+    emAberto: /aberto/i.test(situacao),
+    valorBanco: Number(b.valor) || null,
+    situacao,
+  };
 }
 
 // tira o PDF em base64 que algumas respostas trazem: consulta_sicoob e' para ler
@@ -948,7 +972,7 @@ async function _workerLiquidacao() {
     const lista = await _supaGet(
       "oct_boletos?status=in.(registrado,liquidado)&pago_em=is.null&nosso_numero=not.is.null" +
       `&or=(consultado_em.is.null,consultado_em.lt.${encodeURIComponent(limite)})` +
-      "&select=id,empresa_id,nosso_numero&order=vencimento&limit=30");
+      "&select=id,empresa_id,nosso_numero,baixa_origem&order=vencimento&limit=30");
     const contas = {};
     for (const bol of lista) {
       try {
@@ -979,6 +1003,17 @@ async function _workerLiquidacao() {
             patch.baixa_origem = "sicoob";
             if (l.valor) patch.valor_pago = l.valor;
             console.log(`[liquidacao] ${bol.nosso_numero} pago em ${l.pagoEm}`);
+          } else if (l.baixado) {
+            // baixado no banco (pedido do cedente): nao e' mais cobranca viva
+            patch.status = "cancelado";
+            patch.cancelado_em = (l.baixadoEm || new Date().toISOString().slice(0, 10)) + "T00:00:00+00:00";
+          } else if (l.emAberto && bol.baixa_origem === "extrato") {
+            // O BANCO E' A AUTORIDADE: a baixa pelo extrato casa por VALOR, e em
+            // 14/09 casou um credito de R$ 13.653,18 com o boleto 500012 do Bread
+            // Life, que no banco seguia "Em Aberto". Desfaz a baixa inferida.
+            Object.assign(patch, { status: "registrado", credito_em: null, valor_pago: null,
+                                   baixa_origem: null, liquidado_em: null });
+            console.warn(`[liquidacao] ${bol.nosso_numero}: extrato dizia pago, banco diz em aberto -- baixa desfeita`);
           }
         }
         await _supaPatch(`oct_boletos?id=eq.${bol.id}`, patch, "return=minimal");
