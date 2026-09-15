@@ -404,7 +404,10 @@ const EXT = {
   dias: Number(process.env.EXTRATO_DIAS || 5),
   urlSandbox: "https://sandbox.sicoob.com.br/sicoob/sandbox/conta-corrente/v4",
   urlProd: "https://api.sicoob.com.br/conta-corrente/v4",
-  scope: process.env.SICOOB_EXTRATO_SCOPE || "cco_consulta cco_extrato",
+  // so' cco_consulta: e' o que a conta corrente de PRODUCAO aceita para extrato E
+  // saldo (sync do dev usa assim nas 3 contas). Pedir cco_extrato junto da'
+  // invalid_scope no app do Florestal (15/09/2026) e o token nao sai.
+  scope: process.env.SICOOB_EXTRATO_SCOPE || "cco_consulta",
   estado: { ultima: null, contas: {}, erro: null },
 };
 
