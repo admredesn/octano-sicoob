@@ -1032,6 +1032,64 @@ if (process.env.BOLETO_WORKER === "1" && process.env.BOLETO_CONSULTA !== "0") {
 }
 
 // ============================================================
+// SALDO DA CONTA CORRENTE (B.I › Disponível)
+// ------------------------------------------------------------
+// Grava em oct_banco_saldos o saldo que o Sicoob informa para cada conta
+// (GET /conta-corrente/v4/saldo — testado 15/09/2026 nas 3 contas: vem
+// saldo, saldoBloqueado e saldoLimite em string americana). E puxa o extrato
+// de HOJE: sem ele as transferências do PagBank/BB e os créditos do cofre do
+// dia não entram na conta do disponível até o próximo import.
+// Liga sozinho (SALDO_WORKER=0 desliga). SALDO_POLL_SEGUNDOS, padrão 600.
+// Erro numa conta grava só o campo erro: o último saldo bom continua na tela,
+// com a hora em que foi lido.
+// ============================================================
+const SALDO_POLL = Number(process.env.SALDO_POLL_SEGUNDOS || 600);
+const SALDO_EST = { ultima: null, contas: {} };
+
+async function _saldoConta(conta) {
+  const token = await _tokenConta(conta);
+  const num = String(conta.numero_conta || "").replace(/\D/g, "");
+  const r = await axios.get(`${EXT.urlProd}/saldo?numeroContaCorrente=${num}`, {
+    headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id || CFG.clientId },
+    httpsAgent: _agentePrefix(conta.env_prefix || ""), timeout: 30000,
+  });
+  const d = (r.data && (r.data.resultado || r.data)) || {};
+  return { saldo: _valorNum(d.saldo), saldo_bloqueado: _valorNum(d.saldoBloqueado), saldo_limite: _valorNum(d.saldoLimite) };
+}
+
+async function _workerSaldo() {
+  if (!CFG.supaUrl || !CFG.supaKey) return;
+  try {
+    const contas = await _supaGet("oct_sicoob_contas?ativo=eq.true&ambiente=eq.producao&select=*");
+    for (const conta of contas) {
+      const agora = new Date().toISOString();
+      let reg = { empresa_id: conta.empresa_id, banco: "sicoob", conta: conta.numero_conta, atualizado_em: agora };
+      try {
+        reg = { ...reg, ...(await _saldoConta(conta)), consultado_em: agora, erro: null };
+      } catch (e) {
+        reg.erro = (e.response ? JSON.stringify(e.response.data) : e.message).slice(0, 300);
+      }
+      SALDO_EST.contas[conta.empresa_id] = { saldo: reg.saldo, erro: reg.erro || null, quando: agora };
+      await axios.post(`${CFG.supaUrl}/rest/v1/oct_banco_saldos?on_conflict=empresa_id`, [reg], {
+        headers: _supaHeaders({ Prefer: "resolution=merge-duplicates,return=minimal" }), timeout: 20000,
+      });
+    }
+    // extrato de hoje (data do Brasil), deduplicado por transactionId
+    const hojeBr = new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+    const imp = await importarExtratos({ desde: hojeBr, ate: hojeBr });
+    SALDO_EST.extrato = imp;
+    SALDO_EST.ultima = new Date().toISOString();
+  } catch (e) {
+    console.error("[saldo] worker:", e.response ? JSON.stringify(e.response.data).slice(0, 200) : e.message);
+  }
+}
+if (process.env.SALDO_WORKER !== "0") {
+  setTimeout(_workerSaldo, 30000);
+  setInterval(_workerSaldo, SALDO_POLL * 1000);
+  console.log(`[saldo] worker ligado (a cada ${SALDO_POLL}s)`);
+}
+
+// ============================================================
 // ENVIO DA FATURA AO CLIENTE (e-mail + WhatsApp)
 // ------------------------------------------------------------
 // A tela marca envio_pedido_em na fatura; quem envia e' aqui, porque a senha do
