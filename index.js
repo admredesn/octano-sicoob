@@ -458,7 +458,8 @@ async function _extratoConta(conta, mes, ano, diaIni, diaFim) {
   const base = (conta.ambiente || "producao") === "sandbox" ? EXT.urlSandbox : EXT.urlProd;
   const token = await _tokenConta(conta);
   const url = `${base}/extrato/${mes}/${ano}?diaInicial=${diaIni}&diaFinal=${diaFim}` +
-              `&numeroContaCorrente=${encodeURIComponent(conta.numero_conta)}`;
+              // SO' DIGITOS: com a mascara ("7.431.001-1") a API de producao responde 404
+              `&numeroContaCorrente=${String(conta.numero_conta || "").replace(/\D/g, "")}`;
   const r = await axios.get(url, {
     headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id || CFG.clientId },
     httpsAgent: (conta.ambiente || "producao") === "sandbox" ? undefined : _agentePrefix(conta.env_prefix || ""),
