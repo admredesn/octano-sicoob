@@ -63,14 +63,16 @@ function _ate999(n) {
 function porExtenso(valor) {
   const inteiro = Math.floor(Number(valor || 0));
   const cent = Math.round((Number(valor || 0) - inteiro) * 100);
-  const partes = [];
+  const g = [];
   const mi = Math.floor(inteiro / 1000000);
   const mil = Math.floor((inteiro % 1000000) / 1000);
   const res = inteiro % 1000;
-  if (mi) partes.push(`${_ate999(mi)} ${mi === 1 ? "milhão" : "milhões"}`);
-  if (mil) partes.push(mil === 1 ? "mil" : `${_ate999(mil)} mil`);
-  if (res) partes.push(_ate999(res));
-  let txt = partes.join(" e ") || "zero";
+  if (mi) g.push([mi, `${_ate999(mi)} ${mi === 1 ? "milhão" : "milhões"}`]);
+  if (mil) g.push([mil, mil === 1 ? "mil" : `${_ate999(mil)} mil`]);
+  if (res) g.push([res, _ate999(res)]);
+  // "treze mil seiscentos e cinquenta" -- o "e" entre os grupos so' entra antes do
+  // ultimo quando ele e' menor que cem ou centena redonda ("mil e cem", "mil e vinte")
+  let txt = g.map(([n, t], i) => (i === 0 ? "" : (i === g.length - 1 && (n < 100 || n % 100 === 0)) ? " e " : " ") + t).join("") || "zero";
   txt += inteiro === 1 ? " real" : " reais";
   if (cent) txt += ` e ${_ate999(cent)} ${cent === 1 ? "centavo" : "centavos"}`;
   return txt.toUpperCase();
@@ -81,8 +83,10 @@ function porExtenso(valor) {
  * @param cli    linha de oct_pessoas (o pagador)
  * @param emp    linha de oct_empresas (a origem)
  * @param linhas [{data, produto, placa, odometro, veiculo, hora, cupom, qtd, unit, total}]
+ * @param orig   fatura original quando `fat` e' uma PARCELA (03/10/2026): o extrato e
+ *               os totais sao os da original; o que se cobra e' o valor da parcela
  */
-function gerarFaturaPdf(fat, cli, emp, linhas) {
+function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 0 });
     const pedacos = [];
@@ -113,7 +117,8 @@ function gerarFaturaPdf(fat, cli, emp, linhas) {
 
     // ---------------- cabeçalho ----------------
     doc.font("Helvetica-Bold").fontSize(16);
-    txt("FATURA", L, y, { width: mm(W), align: "center" });
+    txt(orig ? `FATURA — PARCELA ${fat.parcela_num || "?"}/${fat.parcela_total || "?"} (FATURA ${orig.numero || "—"})` : "FATURA",
+        L, y, { width: mm(W), align: "center" });
     y += 8;
     doc.rect(mm(L), mm(y), mm(W), mm(16)).lineWidth(0.5).stroke();
     rot("Origem", L + 1.5, y + 1);
@@ -195,9 +200,10 @@ function gerarFaturaPdf(fat, cli, emp, linhas) {
 
     // ---------------- totalizadores ----------------
     const cT = R - 70;
-    const desc = Number(fat.desconto || 0), acr = Number(fat.acrescimo || 0);
-    const tot = [["Total produtos", fat.valor], ["Multa + juros + acréscimos", acr],
-                 ["Descontos Notas", 0], ["Sub Total", Number(fat.valor || 0) + acr],
+    const base = orig || fat;              // parcela: os totais do extrato sao os da original
+    const desc = Number(base.desconto || 0), acr = Number(base.acrescimo || 0);
+    const tot = [["Total produtos", base.valor], ["Multa + juros + acréscimos", acr],
+                 ["Descontos Notas", 0], ["Sub Total", Number(base.valor || 0) + acr],
                  ["Despesa Acessória", 0], ["Desconto Manual", desc]];
     tot.forEach(([r, v], i) => {
       doc.font("Helvetica").fontSize(7.5).fillColor("#000");
@@ -205,11 +211,16 @@ function gerarFaturaPdf(fat, cli, emp, linhas) {
       doc.font("Helvetica-Bold");
       txt(moeda(v), cT + 46, y + i * 4.4, { width: mm(22), align: "right" });
     });
-    const yTot = y + tot.length * 4.4;
+    let yTot = y + tot.length * 4.4;
     linha(yTot, cT, R);
     doc.font("Helvetica-Bold").fontSize(10);
-    txt("Total:", cT, yTot + 1.5, { width: mm(44), align: "right" });
-    txt(moeda(liquidoDe(fat)), cT + 46, yTot + 1.5, { width: mm(22), align: "right" });
+    txt(orig ? `Total da fatura ${orig.numero || ""}:` : "Total:", cT, yTot + 1.5, { width: mm(44), align: "right" });
+    txt(moeda(liquidoDe(base)), cT + 46, yTot + 1.5, { width: mm(22), align: "right" });
+    if (orig) {
+      yTot += 5.5;
+      txt(`Esta parcela (${fat.parcela_num || "?"}/${fat.parcela_total || "?"}):`, cT, yTot + 1.5, { width: mm(44), align: "right" });
+      txt(moeda(liquidoDe(fat)), cT + 46, yTot + 1.5, { width: mm(22), align: "right" });
+    }
 
     // ---------------- resumo por produto ----------------
     const porProd = {};

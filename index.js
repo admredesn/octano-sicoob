@@ -1434,9 +1434,14 @@ async function montarFaturaPdf(fatura_id) {
       ? (await _supaGet(`oct_pessoas?id=eq.${fat.cliente_id}&select=*`))[0] || {}
       : {};
 
+    // PARCELA (03/10/2026): os titulos continuam na fatura original (status
+    // 'parcelada'); o extrato da parcela e' o da original, com o valor da parcela
+    let orig = null;
+    if (fat.parcela_de) orig = (await _supaGet(`oct_faturas?id=eq.${fat.parcela_de}&select=*`))[0] || null;
+
     // titulos da fatura -> cupons -> itens
     const titulos = await _supaGet(
-      `oct_pdv_notas_prazo?fatura_id=eq.${fatura_id}&select=numero_nfe,valor,registrado_em` +
+      `oct_pdv_notas_prazo?fatura_id=eq.${orig ? orig.id : fatura_id}&select=numero_nfe,valor,registrado_em` +
       `&order=registrado_em`);
     const nums = titulos.map(t => t.numero_nfe).filter(Boolean);
     let vendas = [];
@@ -1472,7 +1477,7 @@ async function montarFaturaPdf(fatura_id) {
       });
     });
 
-    const pdf = await gerarFaturaPdf(fat, cli, emp, linhas);
+    const pdf = await gerarFaturaPdf(fat, cli, emp, linhas, orig);
     return { pdf, fat };
   }
 }
