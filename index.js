@@ -680,8 +680,16 @@ async function _proximoNossoNumero(conta) {
   return prox;
 }
 
-function _montarBoleto(conta, fatura, pagador, nossoNumero) {
+function _montarBoleto(conta, fatura, pagador, nossoNumero, opts) {
+  opts = opts || {};
   const hoje = new Date().toISOString().slice(0, 10);
+  const venc = String(opts.vencimento || fatura.vencimento).slice(0, 10);
+  // dia seguinte ao vencimento: de onde o banco passa a cobrar multa e juros
+  const dtApos = new Date(venc + "T12:00:00Z"); dtApos.setUTCDate(dtApos.getUTCDate() + 1);
+  const aposVenc = dtApos.toISOString().slice(0, 10);
+  const temTaxas = opts.multaPct != null || opts.jurosMesPct != null;     // pedido do Portal Empresas: taxas do posto
+  const jurosPct = temTaxas ? Number(opts.jurosMesPct || 0) : null;
+  const multaPct = temTaxas ? Number(opts.multaPct || 0) : null;
   const doc = _so_digitos(pagador.documento);
   return {
     numeroCliente: Number(conta.numero_cliente),
@@ -698,17 +706,22 @@ function _montarBoleto(conta, fatura, pagador, nossoNumero) {
     // de R$ 773,13 as 12:23 e o boleto foi registrado as 12:24 com o valor CHEIO
     // (R$ 14.426,31) -- a tabela guardou o liquido e o banco ficou com o bruto.
     // Regra do projeto: quem manda na cobranca e' valor_liquido (coluna gerada).
-    valor: Number(fatura.valor_liquido != null ? fatura.valor_liquido : fatura.valor),
-    dataVencimento: String(fatura.vencimento).slice(0, 10),
+    valor: opts.valor != null ? Number(opts.valor)
+         : Number(fatura.valor_liquido != null ? fatura.valor_liquido : fatura.valor),
+    dataVencimento: venc,
     numeroParcela: 1,
     // JUROS E MULTA (obrigatorio -- erro 5002 sem isto).
     //   tipoJurosMora: 1=valor/dia  2=taxa mensal  3=ISENTO
     //   tipoMulta:     0=ISENTO     1=valor fixo   2=percentual
     // Padrao isento: encargo e' decisao do posto. Configuravel por conta.
-    tipoJurosMora: Number(conta.juros_tipo != null ? conta.juros_tipo : 3),
-    valorJurosMora: Number(conta.juros_valor || 0),
-    tipoMulta: Number(conta.multa_tipo != null ? conta.multa_tipo : 0),
-    valorMulta: Number(conta.multa_valor || 0),
+    //   Pedido do Portal Empresas: o boleto vence hoje e, depois de vencido, o banco cobra a multa e os juros do posto
+    //   (Parametros > Cobranca): juros = taxa MENSAL (2), multa = PERCENTUAL (2), a partir do dia seguinte.
+    tipoJurosMora: temTaxas ? (jurosPct > 0 ? 2 : 3) : Number(conta.juros_tipo != null ? conta.juros_tipo : 3),
+    valorJurosMora: temTaxas ? (jurosPct > 0 ? jurosPct : 0) : Number(conta.juros_valor || 0),
+    tipoMulta: temTaxas ? (multaPct > 0 ? 2 : 0) : Number(conta.multa_tipo != null ? conta.multa_tipo : 0),
+    valorMulta: temTaxas ? (multaPct > 0 ? multaPct : 0) : Number(conta.multa_valor || 0),
+    ...(temTaxas && jurosPct > 0 ? { dataJurosMora: aposVenc } : {}),
+    ...(temTaxas && multaPct > 0 ? { dataMulta: aposVenc } : {}),
     //   tipoDesconto: 0=ISENTO 1=valor fixo 2=percentual 3..6=por antecipacao
     tipoDesconto: Number(conta.desconto_tipo != null ? conta.desconto_tipo : 0),
     pagador: {
@@ -734,9 +747,11 @@ async function registrarBoleto(fatura_id, opts) {
   if (!fat.vencimento) return { http: 400, corpo: { ok: false, erro: "fatura sem vencimento" } };
 
   const jaTem = (await _supaGet(
-    `oct_boletos?fatura_id=eq.${fatura_id}&status=in.(registrado,liquidado)&select=id,nosso_numero`))[0];
-  if (jaTem) return { http: 409, corpo: { ok: false, erro: "fatura já tem boleto registrado",
-                                          nosso_numero: jaTem.nosso_numero } };
+    `oct_boletos?fatura_id=eq.${fatura_id}&status=in.(registrado,liquidado)&select=id,nosso_numero,status`))[0];
+  // substituicao (Portal Empresas): o boleto registrado e' o que vai ser cancelado depois do novo; liquidado nunca se substitui
+  if (jaTem && !(opts.substitui && jaTem.status === "registrado")) {
+    return { http: 409, corpo: { ok: false, erro: "fatura já tem boleto registrado", nosso_numero: jaTem.nosso_numero } };
+  }
 
   const conta = (await _supaGet(
     `oct_sicoob_contas?empresa_id=eq.${fat.empresa_id}&ativo=eq.true&select=*`))[0];
@@ -807,7 +822,7 @@ async function registrarBoleto(fatura_id, opts) {
   }
 
   const nossoNumero = await _proximoNossoNumero(conta);
-  const corpo = _montarBoleto(conta, fat, pag, nossoNumero);
+  const corpo = _montarBoleto(conta, fat, pag, nossoNumero, opts);
   const patch = {
     nosso_numero: String(nossoNumero), seu_numero: corpo.seuNumero,
     numero_contrato: String(conta.numero_cliente), modalidade: corpo.codigoModalidade,
@@ -831,8 +846,9 @@ async function registrarBoleto(fatura_id, opts) {
       timeout: 40000,
     });
     const d = resp.data?.resultado || resp.data || {};
-    return { http: 200, corpo: { ok: true, nosso_numero: String(nossoNumero) }, patch: {
+    return { http: 200, corpo: { ok: true, nosso_numero: String(nossoNumero) }, empresa_id: fat.empresa_id, patch: {
       ...patch, status: "registrado", registrado_em: new Date().toISOString(),
+      valor: corpo.valor, vencimento: corpo.dataVencimento,
       linha_digitavel: d.linhaDigitavel || d.linha_digitavel || null,
       codigo_barras: d.codigoBarras || d.codigo_barras || null,
       pix_copia_cola: d.qrCode || d.pixCopiaECola || null,
@@ -872,28 +888,90 @@ app.post("/boleto/registrar", async (req, res) => {
 // ---------- WORKER: pega os boletos que a tela deixou 'pendente' ----------
 // A tela do Faturar so' INSERE a linha pendente; quem tem o certificado e' aqui.
 const BOL_POLL = Number(process.env.BOLETO_POLL_SEGUNDOS || 20);
-async function _workerBoletos() {
+// Baixa (cancela) um boleto registrado no Sicoob. Mesma chamada do _ferramentas/cancelar_boleto_sicoob.py:
+// POST /boletos/{nossoNumero}/baixar {numeroCliente, codigoModalidade} -> 204.
+async function baixarBoletoSicoob(empresaId, nossoNumero) {
+  const conta = (await _supaGet(`oct_sicoob_contas?empresa_id=eq.${empresaId}&ativo=eq.true&select=*`))[0];
+  if (!conta) throw new Error("posto sem conta Sicoob");
+  const token = await _tokenCobranca(conta);
+  const base = (conta.ambiente || "producao") === "sandbox" ? COB.urlSandbox : COB.urlProd;
+  await axios.post(`${base}/boletos/${nossoNumero}/baixar`,
+    { numeroCliente: Number(conta.numero_cliente), codigoModalidade: Number(conta.cobranca_modalidade || 1) }, {
+      headers: { Authorization: `Bearer ${token}`, client_id: conta.client_id, "Content-Type": "application/json" },
+      httpsAgent: (conta.ambiente || "producao") === "sandbox" ? undefined : _agentePrefix(conta.env_prefix || ""),
+      timeout: 40000,
+    });
+}
+
+// O boleto NOVO ja' esta' registrado: cancela o antigo no banco (3 tentativas) e marca 'cancelado' so' depois do banco aceitar.
+async function _cancelarSubstituido(empresaId, antigoNosso, novoId) {
+  let ultimo = null;
+  for (let t = 0; t < 3; t++) {
+    try {
+      await baixarBoletoSicoob(empresaId, antigoNosso);
+      await _supaPatch(`oct_boletos?empresa_id=eq.${empresaId}&nosso_numero=eq.${antigoNosso}&status=eq.registrado`,
+        { status: "cancelado", cancelado_em: new Date().toISOString(), erro: null }, "return=minimal");
+      console.log(`[boletos] boleto ${antigoNosso} cancelado (substituido pelo ${novoId})`);
+      return true;
+    } catch (e) {
+      ultimo = e.response?.data ? JSON.stringify(e.response.data) : String(e.message || e);
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  console.error(`[boletos] NAO consegui cancelar o boleto ${antigoNosso}: ${ultimo}`);
+  await _supaPatch(`oct_boletos?id=eq.${novoId}`,
+    { erro: `Boleto antigo ${antigoNosso} NAO foi cancelado no banco: ${String(ultimo).slice(0, 300)}` }, "return=minimal").catch(() => {});
+  return false;
+}
+
+const _bolEmAndamento = new Set();
+async function _workerBoletos(filtroExtra) {
   try {
-    const pend = await _supaGet(
-      "oct_boletos?status=eq.pendente&select=id,fatura_id&order=criado_em&limit=20");
+    const Q_BASE = "oct_boletos?status=eq.pendente&order=criado_em&limit=20";
+    let pend;
+    try {
+      pend = await _supaGet(Q_BASE + "&select=id,fatura_id,valor_emitir,vencimento_emitir,multa_pct,juros_mes_pct,substitui_nosso_numero,origem" + (filtroExtra || ""));
+    } catch (e) {
+      if (filtroExtra) return;                         // colunas do Portal Empresas ainda nao existem: nada a fazer na fila rapida
+      pend = await _supaGet(Q_BASE + "&select=id,fatura_id");
+    }
     for (const b of pend) {
-      let r;
+      if (_bolEmAndamento.has(b.id)) continue;         // o worker rapido e o de 20 s nao pegam o mesmo pedido
+      _bolEmAndamento.add(b.id);
       try {
-        r = await registrarBoleto(b.fatura_id);
-      } catch (e) {
-        r = { patch: { status: "erro", erro: String(e.message || e).slice(0, 900) } };
+        // a lista pode estar velha (a rodada de 20 s demora): confirma que o pedido ainda e' pendente antes de registrar
+        const vivo = await _supaGet(`oct_boletos?id=eq.${b.id}&status=eq.pendente&select=id`).catch(() => null);
+        if (!vivo || !vivo.length) continue;
+        const opts = {};
+        if (b.valor_emitir != null) opts.valor = Number(b.valor_emitir);
+        if (b.vencimento_emitir) opts.vencimento = String(b.vencimento_emitir).slice(0, 10);
+        if (b.valor_emitir != null) { opts.multaPct = Number(b.multa_pct || 0); opts.jurosMesPct = Number(b.juros_mes_pct || 0); }
+        if (b.substitui_nosso_numero) opts.substitui = String(b.substitui_nosso_numero);
+        let r;
+        try {
+          r = await registrarBoleto(b.fatura_id, opts);
+        } catch (e) {
+          r = { patch: { status: "erro", erro: String(e.message || e).slice(0, 900) } };
+        }
+        const patch = r.patch || { status: "erro", erro: JSON.stringify(r.corpo || {}).slice(0, 900) };
+        await _supaPatch(`oct_boletos?id=eq.${b.id}`, patch, "return=minimal");
+        if (patch.status === "registrado") {
+          await _arquivarBoletoPdf(b.fatura_id);
+          if (opts.substitui && r.empresa_id) await _cancelarSubstituido(r.empresa_id, opts.substitui, b.id);
+        }
+      } finally {
+        _bolEmAndamento.delete(b.id);
       }
-      const patch = r.patch || { status: "erro", erro: JSON.stringify(r.corpo || {}).slice(0, 900) };
-      await _supaPatch(`oct_boletos?id=eq.${b.id}`, patch, "return=minimal");
-      if (patch.status === "registrado") await _arquivarBoletoPdf(b.fatura_id);
     }
   } catch (e) {
     console.error("[boletos] worker:", e.message);
   }
 }
 if (process.env.BOLETO_WORKER === "1") {
-  setInterval(_workerBoletos, BOL_POLL * 1000);
-  console.log(`[boletos] worker ligado (a cada ${BOL_POLL}s)`);
+  setInterval(() => _workerBoletos(), BOL_POLL * 1000);
+  // pedidos do Portal Empresas: o cliente esta' olhando a tela, entao a fila deles e' olhada a cada 2 s
+  setInterval(() => _workerBoletos("&origem=eq.portal_empresas"), Number(process.env.BOLETO_PORTAL_SEGUNDOS || 2) * 1000);
+  console.log(`[boletos] worker ligado (a cada ${BOL_POLL}s; portal a cada 2s)`);
 }
 
 if (process.env.BOLETO_WORKER === "1") {

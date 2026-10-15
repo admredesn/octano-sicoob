@@ -99,13 +99,14 @@ module.exports = function criarPix(deps) {
       return { erro: msg };
     };
     // as 3 consultas sao independentes: uma ida e volta so' (cada uma custa ~0,1-0,2 s)
-    const [conta, alvo, extra, pes] = await Promise.all([
+    const [conta, alvo, extra, pes, taxas] = await Promise.all([
       contaPix(p.empresa_id),
       p.nota_prazo_id
         ? supaGet(`oct_pdv_notas_prazo?id=eq.${p.nota_prazo_id}&select=id,status,fatura_id,valor,cliente_id`)
-        : (p.fatura_id ? supaGet(`oct_faturas?id=eq.${p.fatura_id}&select=id,status,valor,valor_liquido,desconto,acrescimo,cliente_id`) : Promise.resolve([])),
+        : (p.fatura_id ? supaGet(`oct_faturas?id=eq.${p.fatura_id}&select=id,status,valor,valor_liquido,desconto,acrescimo,cliente_id,vencimento`) : Promise.resolve([])),
       p.fatura_id ? supaGet(`oct_recebimentos_titulo?fatura_id=eq.${p.fatura_id}&select=valor`) : Promise.resolve([]),
       p.cliente_id ? supaGet(`oct_pessoas?id=eq.${p.cliente_id}&select=nome,documento`) : Promise.resolve([]),
+      p.fatura_id ? supaGet(`oct_parametros?empresa_id=eq.${p.empresa_id}&chave=in.(cobranca_multa_pct,cobranca_juros_mes_pct)&select=chave,valor`).catch(() => []) : Promise.resolve([]),
     ]);
     if (!conta) return falhar("Pix pelo app nao habilitado neste posto (pix_ativo/chave_pix).");
     if (pausaAte[p.empresa_id] && agoraMs() < pausaAte[p.empresa_id]) {
@@ -126,6 +127,21 @@ module.exports = function criarPix(deps) {
       const liq = f.valor_liquido != null ? Number(f.valor_liquido) : Number(f.valor) - Number(f.desconto || 0) + Number(f.acrescimo || 0);
       valor = Math.round((liq - (extra || []).reduce((sum, r) => sum + Number(r.valor || 0), 0)) * 100) / 100;
       clienteId = f.cliente_id || clienteId;
+      // fatura VENCIDA: o Pix ja' sai com multa (uma vez, % do saldo) e juros (% ao mes, proporcional aos dias de atraso).
+      // Parametros do posto em Parametros > Cobranca; sem parametro = sem encargo. Mesma formula do portal (empresas_portal.encargos).
+      const pct = (v) => { const n = Number(String(v == null ? "" : v).replace(/"/g, "").replace(",", ".")); return isFinite(n) ? Math.max(0, Math.min(100, n)) : 0; };
+      let multaPct = 0, jurosPct = 0;
+      for (const r of taxas || []) {
+        if (r.chave === "cobranca_multa_pct") multaPct = pct(r.valor);
+        else if (r.chave === "cobranca_juros_mes_pct") jurosPct = pct(r.valor);
+      }
+      const hoje = new Date(agoraMs() - 3 * 3600 * 1000).toISOString().slice(0, 10);
+      const venc = String(f.vencimento || "").slice(0, 10);
+      if (venc && venc < hoje && valor > 0 && (multaPct > 0 || jurosPct > 0)) {
+        const dias = Math.round((Date.parse(hoje + "T12:00:00Z") - Date.parse(venc + "T12:00:00Z")) / 86400000);
+        const r2 = (x) => Math.round(x * 100) / 100;
+        valor = r2(valor + r2(valor * multaPct / 100) + r2(valor * (jurosPct / 100 / 30) * dias));
+      }
     }
     if (!(valor > 0)) return falhar("Nada a pagar neste titulo.");
     const corpo = {
