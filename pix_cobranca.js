@@ -182,11 +182,13 @@ module.exports = function criarPix(deps) {
     return res;
   }
 
+  // ATENCAO: o Sicoob recusa (400) qualquer parametro fora do padrao BCB — "paginaAtual" avulso derrubou a 1a versao.
+  // Primeira pagina sem parametro de paginacao; as seguintes por paginacao.paginaAtual.
   async function pixDaJanela(conta, desdeMs) {
     const mapa = {};
+    const base = `?inicio=${encodeURIComponent(iso(desdeMs).replace(/\.\d+Z$/, "Z"))}&fim=${encodeURIComponent(iso(agoraMs()).replace(/\.\d+Z$/, "Z"))}`;
     for (let pg = 0; pg < 5; pg++) {
-      const q = `?inicio=${encodeURIComponent(iso(desdeMs).replace(/\.\d+Z$/, "Z"))}&fim=${encodeURIComponent(iso(agoraMs()).replace(/\.\d+Z$/, "Z"))}&paginaAtual=${pg}`;
-      const r = await chamar(conta, "GET", "/pix" + q);
+      const r = await chamar(conta, "GET", "/pix" + base + (pg ? `&paginacao.paginaAtual=${pg}` : ""));
       if (r.status !== 200) return { erro: erroApi(r), status: r.status, mapa };
       for (const p of r.data.pix || []) if (p.txid) (mapa[p.txid] = mapa[p.txid] || []).push(p);
       const pag = (r.data.parametros || {}).paginacao || {};
@@ -211,15 +213,26 @@ module.exports = function criarPix(deps) {
     for (const emp of Object.keys(porEmpresa)) {
       const rows = porEmpresa[emp];
       if (pausaAte[emp] && agoraMs() < pausaAte[emp]) continue;
-      // cobranca recente (< 3 min): consulta a cada tick; mais velha: no maximo a cada 45 s
-      const recente = rows.some(r => agoraMs() - Date.parse(r.criado_em) < 180000);
-      if (!recente && ultimaConsulta[emp] && agoraMs() - ultimaConsulta[emp] < 45000) continue;
+      // cobranca recente (< 10 min, o cliente esta olhando o QR): consulta a cada tick (2 s);
+      // mais velha: no maximo a cada 30 s. Medido: 1 chamada/s por 30 s seguidas nao da' 429.
+      const recente = rows.some(r => agoraMs() - Date.parse(r.criado_em) < 600000);
+      if (!recente && ultimaConsulta[emp] && agoraMs() - ultimaConsulta[emp] < 30000) continue;
       const conta = await contaPix(emp);
       if (!conta) continue;
       ultimaConsulta[emp] = agoraMs();
       const desde = Math.min(...rows.map(r => Date.parse(r.criado_em))) - 300000;
-      const j = await pixDaJanela(conta, desde);
-      if (j.erro) { log(`[pix] consulta ${emp.slice(0, 8)}: ${j.erro}`); continue; }
+      let j = await pixDaJanela(conta, desde);
+      if (j.erro) {
+        log(`[pix] lista /pix ${emp.slice(0, 8)}: ${j.erro} -> consultando cobranca por cobranca`);
+        if (j.status === 429) continue;
+        j = { mapa: {}, porCob: true };
+        for (const r of rows.slice(0, 10)) {
+          const c = await chamar(conta, "GET", `/cob/${r.txid}`);
+          if (c.status === 200 && c.data.status === "CONCLUIDA" && Array.isArray(c.data.pix) && c.data.pix.length) {
+            j.mapa[r.txid] = c.data.pix.map(p => Object.assign({}, p, { txid: r.txid }));
+          } else if (c.status === 429) break;
+        }
+      }
       for (const r of rows) {
         const pagos = j.mapa[r.txid];
         if (pagos && pagos.length) {
@@ -242,7 +255,16 @@ module.exports = function criarPix(deps) {
     return out;
   }
 
-  return { processarPedidos, consultar, criarCobranca, _t: { cpfOk, cnpjOk, erroApi, pausaAte, tokens } };
+  // renova o token dos postos com Pix ligado antes de vencer (expires_in = 300 s): a cobranca nao espera o handshake
+  async function aquecer() {
+    const contas = await supaGet("oct_sicoob_contas?ativo=eq.true&pix_ativo=eq.true&select=*");
+    for (const c of contas || []) {
+      if (!String(c.chave_pix || "").trim() || (c.ambiente || "producao") !== "producao") continue;
+      try { await token(c); } catch (e) { log(`[pix] aquecer ${String(c.empresa_id).slice(0, 8)}: ${e.message}`); }
+    }
+  }
+
+  return { processarPedidos, consultar, criarCobranca, aquecer, _t: { cpfOk, cnpjOk, erroApi, pausaAte, tokens } };
 };
 module.exports.cpfOk = cpfOk;
 module.exports.cnpjOk = cnpjOk;

@@ -1621,22 +1621,26 @@ const PIX = require("./pix_cobranca")({
 function _ligarPix() {
   if (process.env.PIX_WORKER !== "1") return;
   let ocupadoPed = false, ocupadoCon = false;
-  const pedSeg = Number(process.env.PIX_PEDIDO_SEGUNDOS || 3);
-  const conSeg = Number(process.env.PIX_POLL_SEGUNDOS || 15);
+  const pedSeg = Number(process.env.PIX_PEDIDO_SEGUNDOS || 1);     // o cliente esta olhando a tela: o pedido sai em ~1 s
+  const conSeg = Number(process.env.PIX_POLL_SEGUNDOS || 2);      // o pagamento aparece em ~2 s
   setInterval(async () => {
     if (ocupadoPed) return;
     ocupadoPed = true;
     try { const r = await PIX.processarPedidos(); if (r.criadas || r.erros) console.log("[pix] pedidos:", JSON.stringify(r)); }
     catch (e) { console.error("[pix] pedidos:", e.message); }
     finally { ocupadoPed = false; }
-  }, Math.max(2, pedSeg) * 1000);
+  }, Math.max(1, pedSeg) * 1000);
   setInterval(async () => {
     if (ocupadoCon) return;
     ocupadoCon = true;
     try { const r = await PIX.consultar(); if (r.pagas || r.expiradas || r.retentadas) console.log("[pix] consulta:", JSON.stringify(r)); }
     catch (e) { console.error("[pix] consulta:", e.message); }
     finally { ocupadoCon = false; }
-  }, Math.max(5, conSeg) * 1000);
+  }, Math.max(1, conSeg) * 1000);
+  // renova o token antes de vencer: a 1a cobranca depois de ficar parado nao espera o handshake mTLS
+  const aquecer = () => PIX.aquecer().catch(e => console.error("[pix] aquecer:", e.message));
+  setTimeout(aquecer, 3000);
+  setInterval(aquecer, 240 * 1000);
   console.log(`[pix] worker ligado (pedidos ${pedSeg}s, consulta ${conSeg}s)`);
 }
 
