@@ -1604,8 +1604,45 @@ app.get("/boleto/consultar", async (req, res) => {
 });
 
 
+// ============================================================
+// PIX PELO APP (14/10/2026): cobranca por compra a prazo / fatura, baixa automatica.
+// Logica em pix_cobranca.js (fila oct_pix_cobrancas; sem webhook, consulta por polling).
+// Liga com PIX_WORKER=1; cada posto precisa de oct_sicoob_contas.pix_ativo + chave_pix.
+// ============================================================
+async function _supaRpc(fn, args) {
+  const r = await axios.post(`${CFG.supaUrl}/rest/v1/rpc/${fn}`, args || {}, { headers: _supaHeaders(), timeout: 30000 });
+  return r.data;
+}
+const PIX = require("./pix_cobranca")({
+  axios, tokenUrl: CFG.tokenUrl, supaGet: _supaGet, supaPatch: _supaPatch, supaRpc: _supaRpc,
+  agentePrefix: _agentePrefix, log: (m) => console.log(m),
+  aleatorioHex: (n) => crypto.randomBytes(n).toString("hex"),
+});
+function _ligarPix() {
+  if (process.env.PIX_WORKER !== "1") return;
+  let ocupadoPed = false, ocupadoCon = false;
+  const pedSeg = Number(process.env.PIX_PEDIDO_SEGUNDOS || 3);
+  const conSeg = Number(process.env.PIX_POLL_SEGUNDOS || 15);
+  setInterval(async () => {
+    if (ocupadoPed) return;
+    ocupadoPed = true;
+    try { const r = await PIX.processarPedidos(); if (r.criadas || r.erros) console.log("[pix] pedidos:", JSON.stringify(r)); }
+    catch (e) { console.error("[pix] pedidos:", e.message); }
+    finally { ocupadoPed = false; }
+  }, Math.max(2, pedSeg) * 1000);
+  setInterval(async () => {
+    if (ocupadoCon) return;
+    ocupadoCon = true;
+    try { const r = await PIX.consultar(); if (r.pagas || r.expiradas || r.retentadas) console.log("[pix] consulta:", JSON.stringify(r)); }
+    catch (e) { console.error("[pix] consulta:", e.message); }
+    finally { ocupadoCon = false; }
+  }, Math.max(5, conSeg) * 1000);
+  console.log(`[pix] worker ligado (pedidos ${pedSeg}s, consulta ${conSeg}s)`);
+}
+
 app.listen(CFG.porta, () => {
   console.log(`octano-sicoob on :${CFG.porta} [${CFG.ambiente}] dry_run=${CFG.dryRun} worker=${CFG.workerAtivo}`);
+  _ligarPix();
   if (CFG.workerAtivo) {
     setInterval(() => { processarPendentes().then(r => { if (r.pagos || r.falhas) console.log("worker:", JSON.stringify(r)); }); },
       Math.max(15, CFG.pollSeg) * 1000);
