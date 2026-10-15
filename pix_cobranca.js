@@ -98,26 +98,33 @@ module.exports = function criarPix(deps) {
       await supaPatch(`oct_pix_cobrancas?id=eq.${p.id}`, { status: "erro", erro: String(msg).slice(0, 500), atualizado_em: iso(agoraMs()) }, "return=minimal");
       return { erro: msg };
     };
-    const conta = await contaPix(p.empresa_id);
+    // as 3 consultas sao independentes: uma ida e volta so' (cada uma custa ~0,1-0,2 s)
+    const [conta, alvo, extra, pes] = await Promise.all([
+      contaPix(p.empresa_id),
+      p.nota_prazo_id
+        ? supaGet(`oct_pdv_notas_prazo?id=eq.${p.nota_prazo_id}&select=id,status,fatura_id,valor,cliente_id`)
+        : (p.fatura_id ? supaGet(`oct_faturas?id=eq.${p.fatura_id}&select=id,status,valor,valor_liquido,desconto,acrescimo,cliente_id`) : Promise.resolve([])),
+      p.fatura_id ? supaGet(`oct_recebimentos_titulo?fatura_id=eq.${p.fatura_id}&select=valor`) : Promise.resolve([]),
+      p.cliente_id ? supaGet(`oct_pessoas?id=eq.${p.cliente_id}&select=nome,documento`) : Promise.resolve([]),
+    ]);
     if (!conta) return falhar("Pix pelo app nao habilitado neste posto (pix_ativo/chave_pix).");
     if (pausaAte[p.empresa_id] && agoraMs() < pausaAte[p.empresa_id]) {
       await supaPatch(`oct_pix_cobrancas?id=eq.${p.id}`, { status: "pedido", atualizado_em: iso(agoraMs()) }, "return=minimal");
       return { adiou: true };
     }
-    // confere o alvo AGORA (o valor pode ter mudado desde o pedido) e descobre quem e' o devedor
+    // confere o alvo AGORA (o valor pode ter mudado desde o pedido)
     let valor = Number(p.valor), clienteId = p.cliente_id;
     if (p.nota_prazo_id) {
-      const n = ((await supaGet(`oct_pdv_notas_prazo?id=eq.${p.nota_prazo_id}&select=id,status,fatura_id,valor,cliente_id`)) || [])[0];
+      const n = (alvo || [])[0];
       if (!n) return falhar("Compra nao encontrada.");
       if (n.status !== "aberto" || n.fatura_id) return falhar("Esta compra ja foi paga ou entrou numa fatura.");
       valor = Number(n.valor); clienteId = n.cliente_id || clienteId;
     } else if (p.fatura_id) {
-      const f = ((await supaGet(`oct_faturas?id=eq.${p.fatura_id}&select=id,status,valor,valor_liquido,desconto,acrescimo,cliente_id`)) || [])[0];
+      const f = (alvo || [])[0];
       if (!f) return falhar("Fatura nao encontrada.");
       if (f.status !== "aberta") return falhar("Esta fatura nao esta em aberto.");
       const liq = f.valor_liquido != null ? Number(f.valor_liquido) : Number(f.valor) - Number(f.desconto || 0) + Number(f.acrescimo || 0);
-      const rec = (await supaGet(`oct_recebimentos_titulo?fatura_id=eq.${p.fatura_id}&select=valor`)) || [];
-      valor = Math.round((liq - rec.reduce((s, r) => s + Number(r.valor || 0), 0)) * 100) / 100;
+      valor = Math.round((liq - (extra || []).reduce((sum, r) => sum + Number(r.valor || 0), 0)) * 100) / 100;
       clienteId = f.cliente_id || clienteId;
     }
     if (!(valor > 0)) return falhar("Nada a pagar neste titulo.");
@@ -127,11 +134,12 @@ module.exports = function criarPix(deps) {
       chave: String(conta.chave_pix).trim(),
       solicitacaoPagador: "Octano - compra a prazo",
     };
-    if (clienteId) {
-      const pes = ((await supaGet(`oct_pessoas?id=eq.${clienteId}&select=nome,documento`)) || [])[0];
-      const doc = somenteDigitos(pes && pes.documento);
-      if (pes && pes.nome && cpfOk(doc)) corpo.devedor = { cpf: doc, nome: String(pes.nome).slice(0, 200) };
-      else if (pes && pes.nome && cnpjOk(doc)) corpo.devedor = { cnpj: doc, nome: String(pes.nome).slice(0, 200) };
+    let pessoa = (pes || [])[0];
+    if (clienteId && clienteId !== p.cliente_id) pessoa = ((await supaGet(`oct_pessoas?id=eq.${clienteId}&select=nome,documento`)) || [])[0];
+    if (pessoa && pessoa.nome) {
+      const doc = somenteDigitos(pessoa.documento);
+      if (cpfOk(doc)) corpo.devedor = { cpf: doc, nome: String(pessoa.nome).slice(0, 200) };
+      else if (cnpjOk(doc)) corpo.devedor = { cnpj: doc, nome: String(pessoa.nome).slice(0, 200) };
     }
     const txid = "oct" + aleatorioHex(15);          // 33 caracteres [a-z0-9]
     let r = await chamar(conta, "PUT", `/cob/${txid}`, corpo);
