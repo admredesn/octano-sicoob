@@ -98,10 +98,17 @@ function descontoPorLinha(linhas, fat) {
   const desc = Math.round(Number((fat && fat.desconto) || 0) * 100);
   if (!(desc > 0) || !linhas.length) return zero;
   const regra = fat.desconto_regra || null;
-  if (regra && regra.modo === "litro" && regra.por_produto) {
+  // "litro" = R$/L de desconto; "preco" = PRECO NEGOCIADO por litro (17/10/2026: na 1a fatura o Ronan digitou o preco
+  // no campo de desconto) -> o desconto da linha e' o que passou de qtd x preco (a linha fecha em qtd x preco)
+  if (regra && (regra.modo === "litro" || regra.modo === "preco") && regra.por_produto) {
     const tab = {};
     Object.keys(regra.por_produto).forEach(k => { tab[_prodChave(k)] = Number(regra.por_produto[k] || 0); });
-    const v = linhas.map(l => Math.round(Number(l.qtd || 0) * (tab[_prodChave(l.produto)] || 0) * 100));
+    const v = linhas.map(l => {
+      const t = tab[_prodChave(l.produto)] || 0;
+      if (!(t > 0)) return 0;
+      if (regra.modo === "preco") return Math.max(0, Math.round(Number(l.total || 0) * 100) - Math.round(Number(l.qtd || 0) * t * 100));
+      return Math.round(Number(l.qtd || 0) * t * 100);
+    });
     if (v.reduce((s, x) => s + x, 0) === desc) return v.map(x => x / 100);
     // a regra nao fecha com o desconto gravado (titulos mudaram?): cai no rateio pelo valor
   }
