@@ -86,6 +86,36 @@ function porExtenso(valor) {
  * @param orig   fatura original quando `fat` e' uma PARCELA (03/10/2026): o extrato e
  *               os totais sao os da original; o que se cobra e' o valor da parcela
  */
+// DESCONTO POR ABASTECIMENTO (17/10/2026, Ronan: "tem que mostrar o desconto por abastecimento"). A regra fica em
+// oct_faturas.desconto_regra: {modo:"litro", por_produto:{"OLEO DIESEL S-10": 0.30, ...}} = R$/L de cada produto;
+// sem regra (ou {modo:"total"}) = o desconto da fatura repartido pelo VALOR de cada linha (maior resto: fecha no
+// centavo). A MESMA conta existe no retaguarda (faturar.js, _fatDescontoPorLinha): mudar uma = mudar a outra.
+function _prodChave(n) {
+  return String(n || "").normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/\s+/g, " ").trim().toUpperCase();
+}
+function descontoPorLinha(linhas, fat) {
+  const zero = linhas.map(() => 0);
+  const desc = Math.round(Number((fat && fat.desconto) || 0) * 100);
+  if (!(desc > 0) || !linhas.length) return zero;
+  const regra = fat.desconto_regra || null;
+  if (regra && regra.modo === "litro" && regra.por_produto) {
+    const tab = {};
+    Object.keys(regra.por_produto).forEach(k => { tab[_prodChave(k)] = Number(regra.por_produto[k] || 0); });
+    const v = linhas.map(l => Math.round(Number(l.qtd || 0) * (tab[_prodChave(l.produto)] || 0) * 100));
+    if (v.reduce((s, x) => s + x, 0) === desc) return v.map(x => x / 100);
+    // a regra nao fecha com o desconto gravado (titulos mudaram?): cai no rateio pelo valor
+  }
+  const tot = linhas.map(l => Math.max(0, Math.round(Number(l.total || 0) * 100)));
+  const base = tot.reduce((s, x) => s + x, 0);
+  if (!(base > 0)) return zero;
+  const bruto = tot.map(t => t * desc / base);
+  const out = bruto.map(b => Math.floor(b));
+  let resto = desc - out.reduce((s, x) => s + x, 0);
+  const ordem = bruto.map((b, i) => [b - Math.floor(b), i]).sort((a, b) => (b[0] - a[0]) || (a[1] - b[1]));
+  for (let k = 0; resto > 0 && k < ordem.length; k++, resto--) out[ordem[k][1]] += 1;
+  return out.map(x => x / 100);
+}
+
 function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: "A4", margin: 0 });
@@ -161,12 +191,17 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
     y += 18 + 3;
 
     // ---------------- detalhamento ----------------
-    // colunas: data | produto | placa | odômetro | hora | cupom | qtd | unit | valor
-    const col = [L, L + 20, L + 62, L + 80, L + 94, L + 108, L + 128, L + 150, L + 170, R];
+    // colunas: data | produto | placa | odômetro | hora | cupom | qtd | unit | valor [| desconto | líquido]
+    const base = orig || fat;              // parcela: os totais do extrato sao os da original
+    const descL = descontoPorLinha(linhas, base);
+    const comDesc = descL.some(v => v > 0);
+    const col = comDesc
+      ? [L, L + 16, L + 48, L + 63, L + 76, L + 88, L + 107, L + 123, L + 137, L + 153, L + 169, R]
+      : [L, L + 20, L + 62, L + 80, L + 94, L + 108, L + 128, L + 150, L + 170, R];
     const cab = ["Emissão", "Produto", "Placa", "Odômetro", "Hora", "Nota Fiscal",
-                 "Quantidade", "Val. Unitário", "Valor"];
+                 "Quantidade", "Val. Unitário", "Valor"].concat(comDesc ? ["Desconto", "Líquido"] : []);
     doc.rect(mm(L), mm(y), mm(W), mm(5.5)).fill("#e9e9e9");
-    doc.fillColor("#000").font("Helvetica-Bold").fontSize(6.5);
+    doc.fillColor("#000").font("Helvetica-Bold").fontSize(comDesc ? 6 : 6.5);
     cab.forEach((c, i) => {
       txt(c, col[i] + 1, y + 1.8, { width: mm(col[i + 1] - col[i] - 2),
                                     align: i >= 6 ? "right" : "left" });
@@ -174,19 +209,21 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
     y += 5.5;
     linha(y);
 
-    doc.font("Helvetica").fontSize(7.2);
-    linhas.forEach((it) => {
-      const v = [dataBr(it.data), String(it.produto || "").slice(0, 26),
+    doc.font("Helvetica").fontSize(comDesc ? 6.6 : 7.2);
+    linhas.forEach((it, k) => {
+      const v = [dataBr(it.data), String(it.produto || "").slice(0, comDesc ? 22 : 26),
                  it.placa || (it.veiculo ? String(it.veiculo).slice(0, 14) : "—"),
                  it.odometro ? String(it.odometro) : "—",
                  String(it.hora || "").slice(0, 8),
                  it.cupom ? `CUPOM ${it.cupom}` : "—",
                  num(it.qtd, 4), num(it.unit, 3), moeda(it.total)];
+      if (comDesc) v.push(descL[k] > 0 ? "-" + moeda(descL[k]) : "0,00", moeda(Number(it.total || 0) - descL[k]));
       v.forEach((t, i) => {
-        doc.fillColor("#000");
+        doc.fillColor(i === 9 && descL[k] > 0 ? "#1a7f37" : "#000");
         txt(t, col[i] + 1, y + 1.4, { width: mm(col[i + 1] - col[i] - 2),
                                       align: i >= 6 ? "right" : "left" });
       });
+      doc.fillColor("#000");
       y += 4.6;
       doc.lineWidth(0.2).strokeColor("#ccc")
         .moveTo(mm(L), mm(y)).lineTo(mm(R), mm(y)).stroke();
@@ -200,11 +237,12 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
 
     // ---------------- totalizadores ----------------
     const cT = R - 70;
-    const base = orig || fat;              // parcela: os totais do extrato sao os da original
     const desc = Number(base.desconto || 0), acr = Number(base.acrescimo || 0);
+    // com o desconto por abastecimento ele aparece em "Descontos Notas" (soma das linhas = desconto da fatura)
+    const dNotas = comDesc ? +descL.reduce((s, x) => s + x, 0).toFixed(2) : 0;
     const tot = [["Total produtos", base.valor], ["Multa + juros + acréscimos", acr],
-                 ["Descontos Notas", 0], ["Sub Total", Number(base.valor || 0) + acr],
-                 ["Despesa Acessória", 0], ["Desconto Manual", desc]];
+                 ["Descontos Notas", dNotas], ["Sub Total", Number(base.valor || 0) + acr - dNotas],
+                 ["Despesa Acessória", 0], ["Desconto Manual", +(desc - dNotas).toFixed(2)]];
     tot.forEach(([r, v], i) => {
       doc.font("Helvetica").fontSize(7.5).fillColor("#000");
       txt(r + ":", cT, y + i * 4.4, { width: mm(44), align: "right" });
@@ -224,11 +262,12 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
 
     // ---------------- resumo por produto ----------------
     const porProd = {};
-    linhas.forEach((it) => {
-      const k = it.produto || "—";
-      if (!porProd[k]) porProd[k] = { qtd: 0, total: 0, cod: it.cod || "" };
-      porProd[k].qtd += Number(it.qtd || 0);
-      porProd[k].total += Number(it.total || 0);
+    linhas.forEach((it, k) => {
+      const nm = it.produto || "—";
+      if (!porProd[nm]) porProd[nm] = { qtd: 0, total: 0, desc: 0, cod: it.cod || "" };
+      porProd[nm].qtd += Number(it.qtd || 0);
+      porProd[nm].total += Number(it.total || 0);
+      porProd[nm].desc += descL[k];
     });
     let yp = y;
     doc.font("Helvetica-Bold").fontSize(7.5).fillColor("#000");
@@ -236,17 +275,22 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
     yp += 4.5;
     doc.rect(mm(L), mm(yp), mm(112), mm(5)).fill("#e9e9e9");
     doc.fillColor("#000").font("Helvetica-Bold").fontSize(6.5);
-    [["Produto", L + 1, 46, "left"], ["Quantidade", L + 48, 22, "right"],
-     ["Custo Unitário Média", L + 71, 24, "right"], ["Total", L + 96, 15, "right"]]
-      .forEach(([t, x, w, a]) => txt(t, x, yp + 1.6, { width: mm(w), align: a }));
+    // com desconto: coluna "Desconto" e a media vira a do LIQUIDO (o preco/L que o cliente pagou de fato)
+    const cP = comDesc
+      ? [["Produto", L + 1, 38, "left"], ["Quantidade", L + 40, 18, "right"], ["Média líquida", L + 59, 20, "right"],
+         ["Total", L + 80, 15, "right"], ["Desconto", L + 96, 15, "right"]]
+      : [["Produto", L + 1, 46, "left"], ["Quantidade", L + 48, 22, "right"],
+         ["Custo Unitário Média", L + 71, 24, "right"], ["Total", L + 96, 15, "right"]];
+    cP.forEach(([t, x, w, a]) => txt(t, x, yp + 1.6, { width: mm(w), align: a }));
     yp += 5;
     doc.font("Helvetica").fontSize(7.2);
     Object.entries(porProd).forEach(([nome, p]) => {
-      const media = p.qtd ? p.total / p.qtd : 0;
-      txt(nome.slice(0, 30), L + 1, yp + 1.2, { width: mm(46) });
-      txt(num(p.qtd, 4), L + 48, yp + 1.2, { width: mm(22), align: "right" });
-      txt(num(media, 4), L + 71, yp + 1.2, { width: mm(24), align: "right" });
-      txt(moeda(p.total), L + 96, yp + 1.2, { width: mm(15), align: "right" });
+      const media = p.qtd ? (p.total - (comDesc ? p.desc : 0)) / p.qtd : 0;
+      txt(nome.slice(0, comDesc ? 26 : 30), L + 1, yp + 1.2, { width: mm(cP[0][2]) });
+      txt(num(p.qtd, 4), cP[1][1], yp + 1.2, { width: mm(cP[1][2]), align: "right" });
+      txt(num(media, 4), cP[2][1], yp + 1.2, { width: mm(cP[2][2]), align: "right" });
+      txt(moeda(p.total), cP[3][1], yp + 1.2, { width: mm(cP[3][2]), align: "right" });
+      if (comDesc) txt(p.desc > 0 ? "-" + moeda(p.desc) : "0,00", cP[4][1], yp + 1.2, { width: mm(cP[4][2]), align: "right" });
       yp += 4.4;
       doc.lineWidth(0.2).strokeColor("#ccc")
         .moveTo(mm(L), mm(yp)).lineTo(mm(L + 112), mm(yp)).stroke();
@@ -266,4 +310,4 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
   });
 }
 
-module.exports = { gerarFaturaPdf, porExtenso };
+module.exports = { gerarFaturaPdf, porExtenso, descontoPorLinha };
