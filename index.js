@@ -1526,7 +1526,7 @@ async function montarFaturaPdf(fatura_id) {
     if (nums.length) {
       vendas = await _supaGet(
         `oct_pdv_vendas?empresa_id=eq.${fat.empresa_id}&numero=in.(${nums.join(",")})` +
-        `&select=numero,data_venda,placa,odometro,veiculo,itens&limit=500`);
+        `&select=numero,data_venda,placa,odometro,veiculo,prazo_dados,itens&limit=500`);
     }
     const porNum = {};
     vendas.forEach(v => { porNum[String(v.numero)] = v; });
@@ -1544,10 +1544,15 @@ async function montarFaturaPdf(fatura_id) {
                       qtd: 0, unit: 0, total: Number(t.valor || 0) });
         return;
       }
+      // PLACA/KM DA VENDA DO PDV DO OCTANO (19/10/2026, fatura 101 da Bread Life): o cupom do TecnoX traz placa/odometro
+      // nas colunas; o PDV do Octano guarda o que o operador digitou em prazo_dados {placa, km, veiculo, motorista} —
+      // a fatura saía com "—" embora o comprovante impresso tivesse tudo.
+      const pd = (v && v.prazo_dados && typeof v.prazo_dados === "object") ? v.prazo_dados : {};
       itens.forEach(it => {
         linhas.push({
           data: quando, produto: it.desc || it.produto || "", cod: it.cod,
-          placa: v.placa, odometro: v.odometro, veiculo: v.veiculo,
+          placa: v.placa || pd.placa || null, odometro: v.odometro || pd.km || pd.odometro || null,
+          veiculo: v.veiculo || pd.veiculo || null,
           hora: String(quando || "").slice(11, 19), cupom: t.numero_nfe,
           qtd: Number(it.qtd || 0), unit: Number(it.unit || 0),
           total: Number(it.total != null ? it.total : (it.qtd || 0) * (it.unit || 0)),
