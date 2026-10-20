@@ -183,7 +183,8 @@ function gerarFaturaPdf(fat, cli, emp, linhas, orig) {
     // ---------------- cliente ----------------
     doc.rect(mm(L), mm(y), mm(W), mm(18)).stroke();
     rot("Cliente", L + 1.5, y + 1);
-    val(cli.nome || fat.cliente_nome || "", L + 1.5, y + 4, 120, 9);
+    // código do cliente na frente do nome, como na fatura do TecnoX (20/10/2026)
+    val((cli.tecnox_cod != null ? cli.tecnox_cod + " - " : "") + (cli.nome || fat.cliente_nome || ""), L + 1.5, y + 4, 120, 9);
     rot("CNPJ/CPF", cx + 1.5, y + 1);
     val(cli.documento || "", cx + 1.5, y + 4, 58, 8.5);
     rot("Endereço", L + 1.5, y + 8.5);
