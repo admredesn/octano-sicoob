@@ -1519,7 +1519,7 @@ async function montarFaturaPdf(fatura_id) {
 
     // titulos da fatura -> cupons -> itens
     const titulos = await _supaGet(
-      `oct_pdv_notas_prazo?fatura_id=eq.${orig ? orig.id : fatura_id}&select=numero_nfe,valor,registrado_em` +
+      `oct_pdv_notas_prazo?fatura_id=eq.${orig ? orig.id : fatura_id}&select=numero_nfe,valor,registrado_em,observacao` +
       `&order=registrado_em`);
     const nums = titulos.map(t => t.numero_nfe).filter(Boolean);
     let vendas = [];
@@ -1539,7 +1539,10 @@ async function montarFaturaPdf(fatura_id) {
       if (!itens.length) {
         // sem o cupom espelhado, ao menos o titulo aparece — melhor uma linha
         // sem detalhe do que a fatura nao fechar com o total.
-        linhas.push({ data: quando, produto: "ABASTECIMENTO", cupom: t.numero_nfe,
+        // TITULO SEM CUPOM COM O PRODUTO ANOTADO (20/10/2026, Ronan, fatura 114 do Nailson: "tudo como gasolina"): a
+        // fatura do TecnoX lancada num titulo so' leva "produto: X" na observacao -- a linha sai com esse produto.
+        const pm = /produto:\s*(.+?)\s*(?:\s-\s|;|$)/i.exec(String(t.observacao || ""));
+        linhas.push({ data: quando, produto: (pm && pm[1].trim().toUpperCase()) || "ABASTECIMENTO", cupom: t.numero_nfe,
                       hora: String(quando || "").slice(11, 19),
                       qtd: 0, unit: 0, total: Number(t.valor || 0) });
         return;
